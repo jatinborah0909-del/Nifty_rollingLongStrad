@@ -1,0 +1,1 @@
+worker: python Nifty_Roll_Long_Strad_spot.py
