@@ -1,324 +1,354 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, time, requests, pandas as pd, pytz, psycopg2
+"""
+NIFTY LONG STRADDLE – ATM ROLLING ON STRIKE CHANGE
+-------------------------------------------------
+✔ Entry when spot touches ATM (± ENTRY_TOL)
+✔ After entry: ROLL only when ATM strike changes
+✔ Exit old CE+PE → Buy new CE+PE at new ATM
+✔ Final exit on PROFIT_TARGET or STOP_LOSS
+✔ Multiple rolls allowed
+✔ FUT-based ATR logged
+✔ Railway compatible
+✔ Logs ONLY to nifty_long_strang_roll
+"""
+
+import os, time, math, pytz
 from datetime import datetime, time as dt_time
+import psycopg2
 from kiteconnect import KiteConnect
 
 # =========================================================
-# CONFIG
+# CONFIG (ENV)
 # =========================================================
 
-TRADE_MODE = os.getenv("TRADE_MODE", "PAPER")
-
-STOCKO_BASE_URL     = "https://api.stocko.in"
-STOCKO_ACCESS_TOKEN = os.getenv("STOCKO_ACCESS_TOKEN")
-STOCKO_CLIENT_ID    = os.getenv("STOCKO_CLIENT_ID")
-
-API_KEY      = os.getenv("KITE_API_KEY")
-ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN")
+API_KEY      = os.getenv("KITE_API_KEY", "")
+ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL")
-
-# -------- NIFTY CONFIG --------
-INDEX_SYMBOL = "NSE:NIFTY 50"
-EXCH_OPT     = "NFO"
-UNDERLYING   = "NIFTY"
-STRIKE_STEP  = 50
-
-ENTRY_TOL    = 4
-QTY_PER_LEG  = 65
-
-TICK_INTERVAL  = 1
-WRITE_INTERVAL = 30
-
-MARKET_TZ   = pytz.timezone("Asia/Kolkata")
-TRADE_START = dt_time(9, 15)
-TRADE_END   = dt_time(15, 30)
-
-PROFIT_TARGET = 1400
-
-USE_VIX_FILTER = False
-VIX_SYMBOL     = "NSE:INDIA VIX"
-
-TABLE_NAME      = "niftylong_strangle"
-ROLL_TABLE_NAME = "nifty_long_strang_roll"
-
-# =========================================================
-# SAFETY CHECKS
-# =========================================================
-
-if TRADE_MODE == "LIVE":
-    if not STOCKO_ACCESS_TOKEN or not STOCKO_CLIENT_ID:
-        raise RuntimeError("LIVE mode requires Stocko credentials")
-else:
-    print("[INFO] PAPER mode → Stocko disabled")
 
 if not API_KEY or not ACCESS_TOKEN:
     raise RuntimeError("Missing Kite credentials")
-
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
 
-print(f"""
-====================================
-🚀 BOT STARTING
-MODE        : {TRADE_MODE}
-STOCKO      : {"ENABLED" if TRADE_MODE=="LIVE" else "DISABLED"}
-====================================
-""")
+ENTRY_TOL         = int(os.getenv("ENTRY_TOL", 10))
+QTY_PER_LEG       = int(os.getenv("QTY_PER_LEG", 65))
+PROFIT_TARGET     = float(os.getenv("PROFIT_TARGET", 1500))
+STOP_LOSS         = float(os.getenv("STOP_LOSS", 1500))
+SNAPSHOT_INTERVAL = int(os.getenv("SNAPSHOT_INTERVAL", 30))
+
+MARKET_START_TIME = os.getenv("MARKET_START_TIME", "09:15")
+MARKET_END_TIME   = os.getenv("MARKET_END_TIME", "15:30")
+
+INDEX_SYMBOL  = "NSE:NIFTY 50"
+STRIKE_STEP   = 50
+ATR_PERIOD    = 14
+TICK_INTERVAL = 1
+
+TABLE_NAME = "nifty_long_strang_roll"
+
+MARKET_TZ = pytz.timezone("Asia/Kolkata")
 
 # =========================================================
-# DB INIT (AUTO CREATE BOTH TABLES)
+# TIME HELPERS
 # =========================================================
 
-conn = psycopg2.connect(DATABASE_URL)
-conn.autocommit = True
+def parse_time(t):
+    h, m = map(int, t.split(":"))
+    return dt_time(h, m)
 
-with conn.cursor() as cur:
-    for table in (TABLE_NAME, ROLL_TABLE_NAME):
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {table} (
-                timestamp timestamptz,
-                spot numeric,
-                atm integer,
-                ce_strike integer,
-                pe_strike integer,
-                ce_symbol text,
-                pe_symbol text,
-                ce_entry numeric,
-                pe_entry numeric,
-                ce_ltp numeric,
-                pe_ltp numeric,
-                straddle numeric,
-                m2m numeric,
-                status text,
-                event text,
-                reason text,
-                vix numeric
-            )
-        """)
+MARKET_START = parse_time(MARKET_START_TIME)
+MARKET_END   = parse_time(MARKET_END_TIME)
+
+def in_market_hours(now):
+    return MARKET_START <= now.time() <= MARKET_END
 
 # =========================================================
-# KITE INIT
+# KITE
 # =========================================================
 
 kite = KiteConnect(api_key=API_KEY)
 kite.set_access_token(ACCESS_TOKEN)
 
 # =========================================================
-# UTILS
+# INSTRUMENT RESOLUTION
 # =========================================================
 
-def nowts():
-    return datetime.now(MARKET_TZ)
+NFO = kite.instruments("NFO")
 
-def market_open():
-    t = nowts().time()
-    return TRADE_START <= t <= TRADE_END
+def get_nearest_option(strike, opt_type):
+    opts = [
+        i for i in NFO
+        if i["name"] == "NIFTY"
+        and i["instrument_type"] == opt_type
+        and i["strike"] == strike
+    ]
+    if not opts:
+        return None
+    opts.sort(key=lambda x: x["expiry"])
+    return "NFO:" + opts[0]["tradingsymbol"]
 
-def safe_quote(keys):
-    while True:
-        try:
-            return kite.quote(keys)
-        except Exception as e:
-            print(f"[{nowts()}] quote error: {e}")
-            time.sleep(1)
+def get_nearest_nifty_fut():
+    futs = [i for i in NFO if i["name"] == "NIFTY" and i["instrument_type"] == "FUT"]
+    futs.sort(key=lambda x: x["expiry"])
+    return "NFO:" + futs[0]["tradingsymbol"]
 
-# =========================================================
-# MARKET HELPERS
-# =========================================================
-
-def get_spot_and_atm():
-    q = safe_quote([INDEX_SYMBOL])
-    spot = q[INDEX_SYMBOL]["last_price"]
-    atm  = round(spot / STRIKE_STEP) * STRIKE_STEP
-    return spot, atm
-
-def load_weekly_instruments():
-    df = pd.DataFrame(kite.instruments(EXCH_OPT))
-    df = df[df["name"] == UNDERLYING]
-    df["expiry"] = pd.to_datetime(df["expiry"])
-    expiry = df["expiry"].min()
-    return df[df["expiry"] == expiry], expiry
-
-def get_option_symbols(df, ce, pe):
-    ce_sym = df[(df.strike == ce) & (df.instrument_type == "CE")].iloc[0].tradingsymbol
-    pe_sym = df[(df.strike == pe) & (df.instrument_type == "PE")].iloc[0].tradingsymbol
-    return ce_sym, pe_sym
-
-def get_vix():
-    return safe_quote([VIX_SYMBOL])[VIX_SYMBOL]["last_price"]
+FUT_SYMBOL = get_nearest_nifty_fut()
+print("✅ FUT:", FUT_SYMBOL)
 
 # =========================================================
-# STOCKO (LIVE ONLY)
+# ATR BUILDER
 # =========================================================
 
-def _headers():
-    if TRADE_MODE != "LIVE":
-        raise RuntimeError("Stocko called in PAPER mode")
-    return {
-        "Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
+class FutAtrBuilder:
+    def __init__(self, period):
+        self.period = period
+        self.trs = []
+        self.last_min = None
+        self.h = self.l = self.c = self.prev_c = None
+        self.atr = None
 
-def stocko_search_token(symbol):
-    if TRADE_MODE != "LIVE":
-        raise RuntimeError("Stocko lookup in PAPER mode")
+    def update(self, now, ltp):
+        if ltp is None or math.isnan(ltp):
+            return self.atr
 
-    r = requests.get(
-        f"{STOCKO_BASE_URL}/api/v1/search",
-        params={"key": symbol},
-        headers=_headers(),
-        timeout=10
-    )
-    r.raise_for_status()
+        mk = now.replace(second=0, microsecond=0)
 
-    for rec in r.json().get("result", []):
-        if rec.get("exchange") == EXCH_OPT:
-            return rec["token"]
+        if self.last_min is None:
+            self.last_min = mk
+            self.h = self.l = self.c = self.prev_c = ltp
+            return self.atr
 
-    raise ValueError("Token not found")
+        if mk == self.last_min:
+            self.h = max(self.h, ltp)
+            self.l = min(self.l, ltp)
+            self.c = ltp
+            return self.atr
 
-def place_order(symbol, side, qty, offset):
-    if TRADE_MODE == "PAPER":
-        print(f"[{nowts()}] 🧪 PAPER {side} {symbol}")
-        return
+        tr = max(
+            self.h - self.l,
+            abs(self.h - self.prev_c),
+            abs(self.l - self.prev_c),
+        )
+        self.trs.append(tr)
 
-    token = stocko_search_token(symbol)
+        if len(self.trs) >= self.period:
+            self.atr = round(sum(self.trs[-self.period:]) / self.period, 2)
 
-    payload = {
-        "exchange": EXCH_OPT,
-        "order_type": "MARKET",
-        "instrument_token": int(token),
-        "quantity": qty,
-        "order_side": side,
-        "product": "NRML",
-        "validity": "DAY",
-        "client_id": STOCKO_CLIENT_ID,
-        "user_order_id": str(int(time.time()*1000)+offset)[-15:]
-    }
-
-    requests.post(
-        f"{STOCKO_BASE_URL}/api/v1/orders",
-        json=payload,
-        headers=_headers(),
-        timeout=10
-    )
+        self.prev_c = self.c
+        self.last_min = mk
+        self.h = self.l = self.c = ltp
+        return self.atr
 
 # =========================================================
-# DB LOGGING (WRITE TO BOTH TABLES)
+# DB
 # =========================================================
 
-def log_row(**r):
-    cols = ",".join(r.keys())
-    vals = tuple(r.values())
-    placeholders = ",".join(["%s"] * len(vals))
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-    with conn.cursor() as cur:
+def ensure_table():
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+            timestamp TIMESTAMPTZ,
+            status TEXT,
+            event TEXT,
+            reason TEXT,
+            spot DOUBLE PRECISION,
+            atm INTEGER,
+            ce_symbol TEXT,
+            pe_symbol TEXT,
+            ce_entry DOUBLE PRECISION,
+            pe_entry DOUBLE PRECISION,
+            ce_ltp DOUBLE PRECISION,
+            pe_ltp DOUBLE PRECISION,
+            unreal_pnl DOUBLE PRECISION,
+            realized_pnl DOUBLE PRECISION,
+            atr DOUBLE PRECISION
+        );
+        """)
+        conn.commit()
+
+def log_db(**row):
+    cols = ",".join(row.keys())
+    vals = tuple(row.values())
+    ph   = ",".join(["%s"] * len(vals))
+    with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            f"INSERT INTO {TABLE_NAME} ({cols}) VALUES ({placeholders})",
+            f"INSERT INTO {TABLE_NAME} ({cols}) VALUES ({ph})",
             vals
         )
-        cur.execute(
-            f"INSERT INTO {ROLL_TABLE_NAME} ({cols}) VALUES ({placeholders})",
-            vals
-        )
+        conn.commit()
 
 # =========================================================
-# MAIN
+# HELPERS
 # =========================================================
 
-if __name__ == "__main__":
+def round_to_strike(price):
+    return int(round(price / STRIKE_STEP) * STRIKE_STEP)
 
-    df_expiry, expiry = load_weekly_instruments()
-    print(f"[{nowts()}] WEEKLY EXPIRY → {expiry.date()}")
+def ltp(symbol):
+    return kite.ltp([symbol])[symbol]["last_price"]
 
-    mode = "IDLE"
-    current_atm = None
-    last_write = 0
+# =========================================================
+# STATE
+# =========================================================
 
-    while True:
-        try:
-            if not market_open():
-                time.sleep(5)
+position_open = False
+active_atm = None
+ce_symbol = pe_symbol = None
+ce_entry = pe_entry = None
+
+realized_pnl = 0.0
+atr_builder = FutAtrBuilder(ATR_PERIOD)
+last_snapshot_ts = time.time()
+
+# =========================================================
+# MAIN LOOP
+# =========================================================
+
+ensure_table()
+print("🚀 ATM ROLLING STRADDLE STARTED")
+print(f"🗄️ Logging table: {TABLE_NAME}")
+
+while True:
+    try:
+        now = datetime.now(MARKET_TZ)
+
+        if not in_market_hours(now):
+            time.sleep(5)
+            continue
+
+        spot = ltp(INDEX_SYMBOL)
+        fut_price = ltp(FUT_SYMBOL)
+        atr = atr_builder.update(now, fut_price)
+
+        atm = round_to_strike(spot)
+        diff = abs(spot - atm)
+
+        # ================= ENTRY =================
+        if not position_open and diff <= ENTRY_TOL:
+            ce_symbol = get_nearest_option(atm, "CE")
+            pe_symbol = get_nearest_option(atm, "PE")
+            if not ce_symbol or not pe_symbol:
+                time.sleep(1)
                 continue
 
-            spot, atm = get_spot_and_atm()
-            diff = abs(spot - atm)
+            ce_entry = ltp(ce_symbol)
+            pe_entry = ltp(pe_symbol)
 
-            # ================= ENTRY =================
-            if mode in ("IDLE", "WAITING_REENTRY") and diff <= ENTRY_TOL:
+            active_atm = atm
+            position_open = True
 
-                ce_sym, pe_sym = get_option_symbols(df_expiry, atm, atm)
-                q = safe_quote([f"{EXCH_OPT}:{ce_sym}", f"{EXCH_OPT}:{pe_sym}"])
+            log_db(
+                timestamp=now,
+                status="OPEN",
+                event="ENTRY",
+                reason="ATM_TOUCH",
+                spot=spot,
+                atm=active_atm,
+                ce_symbol=ce_symbol,
+                pe_symbol=pe_symbol,
+                ce_entry=ce_entry,
+                pe_entry=pe_entry,
+                ce_ltp=ce_entry,
+                pe_ltp=pe_entry,
+                unreal_pnl=0.0,
+                realized_pnl=realized_pnl,
+                atr=atr
+            )
 
-                ce_entry = q[f"{EXCH_OPT}:{ce_sym}"]["last_price"]
-                pe_entry = q[f"{EXCH_OPT}:{pe_sym}"]["last_price"]
+        # ================= ROLL (STRIKE CHANGE ONLY) =================
+        if position_open and atm != active_atm:
+            old_ce_ltp = ltp(ce_symbol)
+            old_pe_ltp = ltp(pe_symbol)
 
-                place_order(ce_sym, "BUY", QTY_PER_LEG, 0)
-                place_order(pe_sym, "BUY", QTY_PER_LEG, 1)
+            roll_pnl = (old_ce_ltp - ce_entry + old_pe_ltp - pe_entry) * QTY_PER_LEG
+            realized_pnl += roll_pnl
 
-                current_atm = atm
-                mode = "OPEN"
+            new_ce = get_nearest_option(atm, "CE")
+            new_pe = get_nearest_option(atm, "PE")
 
-                log_row(
-                    timestamp=nowts(),
+            if new_ce and new_pe:
+                ce_symbol, pe_symbol = new_ce, new_pe
+                ce_entry = ltp(ce_symbol)
+                pe_entry = ltp(pe_symbol)
+                active_atm = atm
+
+                log_db(
+                    timestamp=now,
+                    status="OPEN",
+                    event="ROLL",
+                    reason="ATM_CHANGE",
                     spot=spot,
-                    atm=atm,
-                    ce_strike=atm,
-                    pe_strike=atm,
-                    ce_symbol=ce_sym,
-                    pe_symbol=pe_sym,
+                    atm=active_atm,
+                    ce_symbol=ce_symbol,
+                    pe_symbol=pe_symbol,
                     ce_entry=ce_entry,
                     pe_entry=pe_entry,
                     ce_ltp=ce_entry,
                     pe_ltp=pe_entry,
-                    straddle=ce_entry + pe_entry,
-                    m2m=0,
-                    status="OPEN",
-                    event="ENTRY",
-                    reason="ATM_TOUCH",
-                    vix=get_vix() if USE_VIX_FILTER else None
+                    unreal_pnl=0.0,
+                    realized_pnl=realized_pnl,
+                    atr=atr
                 )
 
-            # ================= OPEN =================
-            if mode == "OPEN":
+        # ================= FINAL EXIT =================
+        if position_open:
+            ce_ltp = ltp(ce_symbol)
+            pe_ltp = ltp(pe_symbol)
+            unreal = (ce_ltp - ce_entry + pe_ltp - pe_entry) * QTY_PER_LEG
 
-                q = safe_quote([f"{EXCH_OPT}:{ce_sym}", f"{EXCH_OPT}:{pe_sym}"])
-                ce_ltp = q[f"{EXCH_OPT}:{ce_sym}"]["last_price"]
-                pe_ltp = q[f"{EXCH_OPT}:{pe_sym}"]["last_price"]
+            if unreal >= PROFIT_TARGET or unreal <= -STOP_LOSS:
+                realized_pnl += unreal
+                position_open = False
 
-                m2m = ((ce_ltp - ce_entry) + (pe_ltp - pe_entry)) * QTY_PER_LEG
+                log_db(
+                    timestamp=now,
+                    status="EXIT",
+                    event="FINAL_EXIT",
+                    reason="TARGET" if unreal >= PROFIT_TARGET else "SL",
+                    spot=spot,
+                    atm=active_atm,
+                    ce_symbol=ce_symbol,
+                    pe_symbol=pe_symbol,
+                    ce_entry=ce_entry,
+                    pe_entry=pe_entry,
+                    ce_ltp=ce_ltp,
+                    pe_ltp=pe_ltp,
+                    unreal_pnl=unreal,
+                    realized_pnl=realized_pnl,
+                    atr=atr
+                )
 
-                if m2m >= PROFIT_TARGET:
-                    place_order(ce_sym, "SELL", QTY_PER_LEG, 2)
-                    place_order(pe_sym, "SELL", QTY_PER_LEG, 3)
-                    mode = "WAITING_REENTRY"
+                active_atm = None
+                ce_symbol = pe_symbol = None
+                ce_entry = pe_entry = None
 
-                if time.time() - last_write >= WRITE_INTERVAL:
-                    log_row(
-                        timestamp=nowts(),
-                        spot=spot,
-                        atm=current_atm,
-                        ce_strike=current_atm,
-                        pe_strike=current_atm,
-                        ce_symbol=ce_sym,
-                        pe_symbol=pe_sym,
-                        ce_entry=ce_entry,
-                        pe_entry=pe_entry,
-                        ce_ltp=ce_ltp,
-                        pe_ltp=pe_ltp,
-                        straddle=ce_ltp + pe_ltp,
-                        m2m=m2m,
-                        status="OPEN",
-                        event="SNAPSHOT",
-                        reason="",
-                        vix=get_vix() if USE_VIX_FILTER else None
-                    )
-                    last_write = time.time()
+            elif time.time() - last_snapshot_ts >= SNAPSHOT_INTERVAL:
+                last_snapshot_ts = time.time()
+                log_db(
+                    timestamp=now,
+                    status="RUNNING",
+                    event="SNAPSHOT",
+                    reason="",
+                    spot=spot,
+                    atm=active_atm,
+                    ce_symbol=ce_symbol,
+                    pe_symbol=pe_symbol,
+                    ce_entry=ce_entry,
+                    pe_entry=pe_entry,
+                    ce_ltp=ce_ltp,
+                    pe_ltp=pe_ltp,
+                    unreal_pnl=unreal,
+                    realized_pnl=realized_pnl,
+                    atr=atr
+                )
 
-            time.sleep(TICK_INTERVAL)
+        time.sleep(TICK_INTERVAL)
 
-        except Exception as e:
-            print(f"[{nowts()}] ERROR → {e}")
-            time.sleep(2)
+    except Exception as e:
+        print("❌ ERROR:", e)
+        time.sleep(5)
