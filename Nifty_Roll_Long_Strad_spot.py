@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-NIFTY LONG STRADDLE – ATM ROLLING ON STRIKE CHANGE
--------------------------------------------------
+NIFTY LONG STRADDLE – ATM ROLLING ON STRIKE CHANGE (WITH VIX)
+------------------------------------------------------------
 ✔ Entry when spot touches ATM (± ENTRY_TOL)
 ✔ After entry: ROLL only when ATM strike changes
 ✔ Exit old CE+PE → Buy new CE+PE at new ATM
 ✔ Final exit on PROFIT_TARGET or STOP_LOSS
 ✔ Multiple rolls allowed
 ✔ FUT-based ATR logged
+✔ VIX (PREV CLOSE + LIVE) logged
 ✔ Railway compatible
 ✔ Logs ONLY to nifty_long_strang_roll
 """
@@ -70,6 +71,17 @@ def in_market_hours(now):
 
 kite = KiteConnect(api_key=API_KEY)
 kite.set_access_token(ACCESS_TOKEN)
+
+# =========================================================
+# VIX
+# =========================================================
+
+def get_vix():
+    q = kite.quote(["NSE:INDIA VIX"])
+    d = q["NSE:INDIA VIX"]
+    vix_prev = float(d["ohlc"]["close"]) if d.get("ohlc") else None
+    vix = float(d["last_price"]) if d.get("last_price") else None
+    return vix_prev, vix
 
 # =========================================================
 # INSTRUMENT RESOLUTION
@@ -166,7 +178,9 @@ def ensure_table():
             pe_ltp DOUBLE PRECISION,
             unreal_pnl DOUBLE PRECISION,
             realized_pnl DOUBLE PRECISION,
-            atr DOUBLE PRECISION
+            atr DOUBLE PRECISION,
+            vix_prev DOUBLE PRECISION,
+            vix DOUBLE PRECISION
         );
         """)
         conn.commit()
@@ -225,6 +239,8 @@ while True:
         fut_price = ltp(FUT_SYMBOL)
         atr = atr_builder.update(now, fut_price)
 
+        vix_prev, vix = get_vix()
+
         atm = round_to_strike(spot)
         diff = abs(spot - atm)
 
@@ -257,10 +273,12 @@ while True:
                 pe_ltp=pe_entry,
                 unreal_pnl=0.0,
                 realized_pnl=realized_pnl,
-                atr=atr
+                atr=atr,
+                vix_prev=vix_prev,
+                vix=vix
             )
 
-        # ================= ROLL (STRIKE CHANGE ONLY) =================
+        # ================= ROLL =================
         if position_open and atm != active_atm:
             old_ce_ltp = ltp(ce_symbol)
             old_pe_ltp = ltp(pe_symbol)
@@ -292,10 +310,12 @@ while True:
                     pe_ltp=pe_entry,
                     unreal_pnl=0.0,
                     realized_pnl=realized_pnl,
-                    atr=atr
+                    atr=atr,
+                    vix_prev=vix_prev,
+                    vix=vix
                 )
 
-        # ================= FINAL EXIT =================
+        # ================= FINAL EXIT / SNAPSHOT =================
         if position_open:
             ce_ltp = ltp(ce_symbol)
             pe_ltp = ltp(pe_symbol)
@@ -320,7 +340,9 @@ while True:
                     pe_ltp=pe_ltp,
                     unreal_pnl=unreal,
                     realized_pnl=realized_pnl,
-                    atr=atr
+                    atr=atr,
+                    vix_prev=vix_prev,
+                    vix=vix
                 )
 
                 active_atm = None
@@ -344,7 +366,9 @@ while True:
                     pe_ltp=pe_ltp,
                     unreal_pnl=unreal,
                     realized_pnl=realized_pnl,
-                    atr=atr
+                    atr=atr,
+                    vix_prev=vix_prev,
+                    vix=vix
                 )
 
         time.sleep(TICK_INTERVAL)
