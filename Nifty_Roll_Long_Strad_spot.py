@@ -162,6 +162,7 @@ def get_conn():
 
 def ensure_table():
     with get_conn() as conn, conn.cursor() as cur:
+        # Base table (safe)
         cur.execute(f"""
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
             timestamp TIMESTAMPTZ,
@@ -178,12 +179,16 @@ def ensure_table():
             pe_ltp DOUBLE PRECISION,
             unreal_pnl DOUBLE PRECISION,
             realized_pnl DOUBLE PRECISION,
-            atr DOUBLE PRECISION,
-            vix_prev DOUBLE PRECISION,
-            vix DOUBLE PRECISION
+            atr DOUBLE PRECISION
         );
         """)
+
+        # ---- SCHEMA MIGRATION (THIS WAS MISSING) ----
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS vix_prev DOUBLE PRECISION;")
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS vix DOUBLE PRECISION;")
+
         conn.commit()
+
 
 def log_db(**row):
     cols = ",".join(row.keys())
