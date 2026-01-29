@@ -4,14 +4,14 @@
 """
 NIFTY LONG STRADDLE – SAFE ATM ROLLING (TOLERANCE BASED)
 -------------------------------------------------------
-✔ Entry only when spot touches ATM ± ENTRY_TOL
-✔ Roll only when spot touches a NEW 50pt strike ± ENTRY_TOL
+✔ Entry when spot touches ATM ± ENTRY_TOL
+✔ Roll only on NEW 50pt strike ± ENTRY_TOL
 ✔ No midpoint flip-flop
-✔ No multiple rolls on same strike
 ✔ FUT-based ATR
 ✔ VIX logging
-✔ Railway compatible
-✔ Logs ONLY to nifty_long_strang_roll
+✔ Per-minute M2M snapshot logging
+✔ Entry + Exit prices persisted (ROLL + FINAL EXIT)
+✔ PostgreSQL (Railway safe, schema auto-migration)
 """
 
 import os, time, math, pytz
@@ -169,6 +169,8 @@ def ensure_table():
             pe_symbol TEXT,
             ce_entry DOUBLE PRECISION,
             pe_entry DOUBLE PRECISION,
+            ce_exit DOUBLE PRECISION,
+            pe_exit DOUBLE PRECISION,
             ce_ltp DOUBLE PRECISION,
             pe_ltp DOUBLE PRECISION,
             unreal_pnl DOUBLE PRECISION,
@@ -178,6 +180,11 @@ def ensure_table():
             vix DOUBLE PRECISION
         );
         """)
+        conn.commit()
+
+        # Auto-migrate (safe)
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS ce_exit DOUBLE PRECISION;")
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS pe_exit DOUBLE PRECISION;")
         conn.commit()
 
 def log_db(**row):
@@ -196,7 +203,6 @@ def ltp(symbol):
     return kite.ltp([symbol])[symbol]["last_price"]
 
 def round_to_strike(price):
-    # NO banker rounding
     return int(math.floor(price / STRIKE_STEP + 0.5) * STRIKE_STEP)
 
 # =========================================================
@@ -210,13 +216,14 @@ ce_entry = pe_entry = None
 realized_pnl = 0.0
 
 atr_builder = FutAtrBuilder(ATR_PERIOD)
+last_snapshot_min = None
 
 # =========================================================
 # MAIN LOOP
 # =========================================================
 
 ensure_table()
-print("🚀 SAFE ATM ROLLING STRADDLE STARTED")
+print("🚀 NIFTY LONG STRADDLE STARTED")
 
 while True:
     try:
@@ -244,8 +251,10 @@ while True:
 
             ce_entry = ltp(ce_symbol)
             pe_entry = ltp(pe_symbol)
-            active_atm = atm
+
             position_open = True
+            active_atm = atm
+            last_snapshot_min = None
 
             log_db(
                 timestamp=now,
@@ -258,6 +267,8 @@ while True:
                 pe_symbol=pe_symbol,
                 ce_entry=ce_entry,
                 pe_entry=pe_entry,
+                ce_exit=None,
+                pe_exit=None,
                 ce_ltp=ce_entry,
                 pe_ltp=pe_entry,
                 unreal_pnl=0,
@@ -268,22 +279,12 @@ while True:
             )
 
         # ================= SAFE ROLL =================
-        if (
-            position_open
-            and atm != active_atm
-            and dist <= ENTRY_TOL
-        ):
+        if position_open and atm != active_atm and dist <= ENTRY_TOL:
             old_ce_ltp = ltp(ce_symbol)
             old_pe_ltp = ltp(pe_symbol)
 
             roll_pnl = (old_ce_ltp - ce_entry + old_pe_ltp - pe_entry) * QTY_PER_LEG
             realized_pnl += roll_pnl
-
-            ce_symbol = get_nearest_option(atm, "CE")
-            pe_symbol = get_nearest_option(atm, "PE")
-            ce_entry = ltp(ce_symbol)
-            pe_entry = ltp(pe_symbol)
-            active_atm = atm
 
             log_db(
                 timestamp=now,
@@ -296,8 +297,10 @@ while True:
                 pe_symbol=pe_symbol,
                 ce_entry=ce_entry,
                 pe_entry=pe_entry,
-                ce_ltp=ce_entry,
-                pe_ltp=pe_entry,
+                ce_exit=old_ce_ltp,
+                pe_exit=old_pe_ltp,
+                ce_ltp=old_ce_ltp,
+                pe_ltp=old_pe_ltp,
                 unreal_pnl=0,
                 realized_pnl=realized_pnl,
                 atr=atr,
@@ -305,11 +308,43 @@ while True:
                 vix=vix
             )
 
-        # ================= EXIT =================
+            ce_symbol = get_nearest_option(atm, "CE")
+            pe_symbol = get_nearest_option(atm, "PE")
+            ce_entry = ltp(ce_symbol)
+            pe_entry = ltp(pe_symbol)
+            active_atm = atm
+            last_snapshot_min = None
+
+        # ================= POSITION MGMT =================
         if position_open:
             ce_ltp = ltp(ce_symbol)
             pe_ltp = ltp(pe_symbol)
             unreal = (ce_ltp - ce_entry + pe_ltp - pe_entry) * QTY_PER_LEG
+
+            this_min = now.replace(second=0, microsecond=0)
+            if last_snapshot_min is None or this_min > last_snapshot_min:
+                last_snapshot_min = this_min
+                log_db(
+                    timestamp=now,
+                    status="OPEN",
+                    event="M2M",
+                    reason="SNAPSHOT",
+                    spot=spot,
+                    atm=active_atm,
+                    ce_symbol=ce_symbol,
+                    pe_symbol=pe_symbol,
+                    ce_entry=ce_entry,
+                    pe_entry=pe_entry,
+                    ce_exit=None,
+                    pe_exit=None,
+                    ce_ltp=ce_ltp,
+                    pe_ltp=pe_ltp,
+                    unreal_pnl=unreal,
+                    realized_pnl=realized_pnl,
+                    atr=atr,
+                    vix_prev=vix_prev,
+                    vix=vix
+                )
 
             if unreal >= PROFIT_TARGET or unreal <= -STOP_LOSS:
                 realized_pnl += unreal
@@ -326,6 +361,8 @@ while True:
                     pe_symbol=pe_symbol,
                     ce_entry=ce_entry,
                     pe_entry=pe_entry,
+                    ce_exit=ce_ltp,
+                    pe_exit=pe_ltp,
                     ce_ltp=ce_ltp,
                     pe_ltp=pe_ltp,
                     unreal_pnl=unreal,
@@ -337,6 +374,8 @@ while True:
 
                 active_atm = None
                 ce_symbol = pe_symbol = None
+                ce_entry = pe_entry = None
+                last_snapshot_min = None
 
         time.sleep(TICK_INTERVAL)
 
