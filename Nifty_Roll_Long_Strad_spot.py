@@ -2,18 +2,34 @@
 # -*- coding: utf-8 -*-
 
 """
-NIFTY LONG STRADDLE – SAFE ATM ROLLING (TOLERANCE BASED) + STOCKO LIVE EXEC
----------------------------------------------------------------------------
+NIFTY LONG STRADDLE – SAFE ATM ROLLING (TOLERANCE BASED) + STOCKO LIVE
+---------------------------------------------------------------------
 ✔ Entry when spot touches ATM ± ENTRY_TOL
-✔ Roll only on NEW 50pt strike ± ENTRY_TOL
+✔ LONG straddle: BUY CE + BUY PE on entry
+✔ Roll only on NEW 50pt strike ± ENTRY_TOL (exit old -> enter new)
 ✔ No midpoint flip-flop
 ✔ FUT-based ATR
 ✔ VIX logging
-✔ Per-minute M2M snapshot logging
+✔ Per-minute M2M snapshot logging (exactly once per minute while OPEN)
 ✔ Entry + Exit prices persisted (ROLL + FINAL EXIT)
 ✔ PostgreSQL (Railway safe, schema auto-migration)
-✔ LIVE order placement via STOCKO (token-based) when LIVE_MODE=true
-✔ PAPER mode does NOT require Stocko creds
+
+🟢 STOCKO integration (using your proven logic)
+- Symbol -> Stocko token via /api/v1/search (NFO)
+- Numeric-only user_order_id (<=15 digits) with offsets to ensure uniqueness
+- Places MARKET orders via /api/v1/orders
+
+ENV REQUIRED (Railway):
+- STOCKO_BASE_URL (default https://api.stocko.in)
+- STOCKO_ACCESS_TOKEN
+- STOCKO_CLIENT_ID
+Optional:
+- STOCKO_PRODUCT (default NRML)
+- STOCKO_ORDER_TYPE (default MARKET)
+- STOCKO_VALIDITY (default DAY)
+
+NOTE:
+- This script executes LIVE orders when STOCKO_* env vars are set.
 """
 
 import os, time, math, pytz, requests
@@ -45,23 +61,27 @@ TICK_INTERVAL = 1
 TABLE_NAME = "nifty_long_strang_roll"
 MARKET_TZ = pytz.timezone("Asia/Kolkata")
 
-# LIVE via Stocko
-LIVE_MODE = os.getenv("LIVE_MODE", "false").strip().lower() in ("1", "true", "yes", "y", "on")
-STOCKO_BASE_URL     = os.getenv("STOCKO_BASE_URL", "https://api.stocko.in").strip()
-STOCKO_ACCESS_TOKEN = os.getenv("STOCKO_ACCESS_TOKEN", "").strip()
-STOCKO_CLIENT_ID    = os.getenv("STOCKO_CLIENT_ID", "").strip()
+# --- STOCKO (proven logic settings) ---
+STOCKO_BASE_URL     = os.getenv("STOCKO_BASE_URL", "https://api.stocko.in").rstrip("/")
+STOCKO_ACCESS_TOKEN = os.getenv("STOCKO_ACCESS_TOKEN", "")
+STOCKO_CLIENT_ID    = os.getenv("STOCKO_CLIENT_ID", "")
+
+STOCKO_PRODUCT   = os.getenv("STOCKO_PRODUCT", "NRML")
+STOCKO_ORDER_TYPE = os.getenv("STOCKO_ORDER_TYPE", "MARKET")
+STOCKO_VALIDITY  = os.getenv("STOCKO_VALIDITY", "DAY")
 
 # =========================================================
 # VALIDATION
 # =========================================================
 
 if not API_KEY or not ACCESS_TOKEN:
-    raise RuntimeError("Missing Kite credentials")
+    raise RuntimeError("Missing Kite credentials (KITE_API_KEY / KITE_ACCESS_TOKEN)")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
 
-if LIVE_MODE and (not STOCKO_ACCESS_TOKEN or not STOCKO_CLIENT_ID):
-    raise RuntimeError("LIVE_MODE=true but STOCKO_ACCESS_TOKEN / STOCKO_CLIENT_ID missing")
+# Stocko must be present for live placement
+if not STOCKO_ACCESS_TOKEN or not STOCKO_CLIENT_ID:
+    raise RuntimeError("Missing Stocko credentials (STOCKO_ACCESS_TOKEN / STOCKO_CLIENT_ID)")
 
 # =========================================================
 # TIME HELPERS
@@ -77,8 +97,11 @@ MARKET_END   = parse_time(MARKET_END_TIME)
 def in_market_hours(now):
     return MARKET_START <= now.time() <= MARKET_END
 
+def nowts():
+    return datetime.now(MARKET_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
 # =========================================================
-# KITE (DATA ONLY)
+# KITE
 # =========================================================
 
 kite = KiteConnect(api_key=API_KEY)
@@ -217,20 +240,13 @@ def round_to_strike(price):
     return int(math.floor(price / STRIKE_STEP + 0.5) * STRIKE_STEP)
 
 # =========================================================
-# STOCKO (LIVE EXECUTION)
+# STOCKO – ORDER PLACEMENT (EXACT LOGIC YOU TRUST)
 # =========================================================
 
 def _stocko_headers():
     return {"Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}", "Content-Type": "application/json"}
 
-def _gen_user_order_id(offset=0) -> str:
-    base = int(time.time() * 1000) + int(offset)
-    return str(base)[-15:]
-
 def stocko_search_token(keyword: str) -> int:
-    """
-    keyword: tradingsymbol, e.g. "NIFTY24FEB22500CE"
-    """
     url = f"{STOCKO_BASE_URL}/api/v1/search"
     r = requests.get(url, params={"key": keyword}, headers=_stocko_headers(), timeout=10)
     r.raise_for_status()
@@ -239,54 +255,59 @@ def stocko_search_token(keyword: str) -> int:
     for rec in result:
         if rec.get("exchange") == "NFO":
             return int(rec["token"])
-    raise RuntimeError(f"Stocko search: no NFO token found for {keyword}")
+    raise ValueError(f"No NFO token found for {keyword}")
 
-def stocko_place_order_token(token: int, side: str, qty: int, offset=0):
-    """
-    side: BUY / SELL
-    """
+def generate_numeric_order_id(offset=0):
+    base = int(time.time() * 1000)  # ms
+    return str(base + offset)[-15:]
+
+def stocko_place_order_token(token: int, side: str, qty: int,
+                             exchange="NFO", order_type=None,
+                             product=None, validity=None,
+                             price=0, trigger_price=0, offset=0):
     url = f"{STOCKO_BASE_URL}/api/v1/orders"
+    order_id = generate_numeric_order_id(offset)
     payload = {
-        "exchange": "NFO",
-        "order_type": "MARKET",
+        "exchange": exchange,
+        "order_type": (order_type or STOCKO_ORDER_TYPE),
         "instrument_token": int(token),
         "quantity": int(qty),
         "disclosed_quantity": 0,
         "order_side": side.upper(),
-        "price": 0,
-        "trigger_price": 0,
-        "validity": "DAY",
-        "product": "NRML",
+        "price": price,
+        "trigger_price": trigger_price,
+        "validity": (validity or STOCKO_VALIDITY),
+        "product": (product or STOCKO_PRODUCT),
         "client_id": STOCKO_CLIENT_ID,
-        "user_order_id": _gen_user_order_id(offset),
+        "user_order_id": order_id,
         "market_protection_percentage": 0,
-        "device": "WEB",
+        "device": "WEB"
     }
+
+    print(f"[{nowts()}] 🆔 Stocko {side.upper()} token={token} user_order_id={order_id}")
     r = requests.post(url, json=payload, headers=_stocko_headers(), timeout=10)
     if r.status_code != 200:
-        raise RuntimeError(f"Stocko order failed: {r.status_code} {r.text}")
+        raise RuntimeError(f"Stocko {side.upper()} failed: {r.status_code} → {r.text}")
     return r.json()
 
-def stocko_place_by_tradingsymbol(tsym: str, side: str, qty: int, offset=0):
+def stocko_place_by_symbol(trading_symbol: str, side: str, qty: int, offset: int):
     """
-    tsym: tradingsymbol WITHOUT exchange prefix, e.g. "NIFTY24FEB22500CE"
+    trading_symbol may be 'NFO:NIFTY....' or 'NIFTY....'
+    Stocko search expects keyword like 'NIFTY....' (without 'NFO:').
     """
-    if not LIVE_MODE:
-        return {"simulated": True}
-    tok = stocko_search_token(tsym)
-    return stocko_place_order_token(tok, side, qty, offset=offset)
+    keyword = trading_symbol.split(":", 1)[1] if ":" in trading_symbol else trading_symbol
+    token = stocko_search_token(keyword)
+    return stocko_place_order_token(token, side, qty, offset=offset)
 
-def place_leg(symbol_with_exch: str, side: str, qty: int, offset: int):
-    """
-    LIVE_MODE -> places Stocko order, PAPER -> does nothing.
-    symbol_with_exch: "NFO:TRADINGSYMBOL"
-    """
-    if not LIVE_MODE:
-        return
-    exch, tsym = symbol_with_exch.split(":", 1)
-    if exch != "NFO":
-        raise RuntimeError(f"Stocko execution supports NFO only. Got: {symbol_with_exch}")
-    stocko_place_by_tradingsymbol(tsym, side, qty, offset=offset)
+def stocko_open_long_straddle(ce_symbol: str, pe_symbol: str):
+    # LONG: BUY CE + BUY PE
+    stocko_place_by_symbol(ce_symbol, "BUY", QTY_PER_LEG, offset=0)
+    stocko_place_by_symbol(pe_symbol, "BUY", QTY_PER_LEG, offset=1)
+
+def stocko_close_long_straddle(ce_symbol: str, pe_symbol: str):
+    # EXIT: SELL CE + SELL PE
+    stocko_place_by_symbol(ce_symbol, "SELL", QTY_PER_LEG, offset=2)
+    stocko_place_by_symbol(pe_symbol, "SELL", QTY_PER_LEG, offset=3)
 
 # =========================================================
 # STATE
@@ -306,7 +327,7 @@ last_snapshot_min = None
 # =========================================================
 
 ensure_table()
-print(f"🚀 NIFTY LONG STRADDLE STARTED | LIVE_MODE={LIVE_MODE} | Orders={'STOCKO' if LIVE_MODE else 'SIM'}")
+print("🚀 NIFTY LONG STRADDLE STARTED (LIVE via STOCKO)")
 
 while True:
     try:
@@ -332,13 +353,12 @@ while True:
                 time.sleep(1)
                 continue
 
-            # Use Kite LTP as recorded entry price (same as your working flow)
+            # LIVE ENTRY: BUY CE + BUY PE
+            stocko_open_long_straddle(ce_symbol, pe_symbol)
+
+            # Record entry prices (MARKET -> use LTP proxy)
             ce_entry = ltp(ce_symbol)
             pe_entry = ltp(pe_symbol)
-
-            # LIVE: place Stocko BUY orders
-            place_leg(ce_symbol, "BUY", QTY_PER_LEG, offset=1)
-            place_leg(pe_symbol, "BUY", QTY_PER_LEG, offset=2)
 
             position_open = True
             active_atm = atm
@@ -371,18 +391,18 @@ while True:
             old_ce_ltp = ltp(ce_symbol)
             old_pe_ltp = ltp(pe_symbol)
 
-            # LIVE: exit old legs first
-            place_leg(ce_symbol, "SELL", QTY_PER_LEG, offset=101)
-            place_leg(pe_symbol, "SELL", QTY_PER_LEG, offset=102)
-
+            # Realize PnL on old legs (LONG)
             roll_pnl = (old_ce_ltp - ce_entry + old_pe_ltp - pe_entry) * QTY_PER_LEG
             realized_pnl += roll_pnl
+
+            # LIVE ROLL EXIT: SELL old CE/PE
+            stocko_close_long_straddle(ce_symbol, pe_symbol)
 
             log_db(
                 timestamp=now,
                 status="OPEN",
                 event="ROLL",
-                reason=f"ATM_TOUCH_{active_atm}_TO_{atm}",
+                reason="ATM_TOUCH",
                 spot=spot,
                 atm=active_atm,
                 ce_symbol=ce_symbol,
@@ -400,16 +420,26 @@ while True:
                 vix=vix
             )
 
-            # Enter new ATM
-            ce_symbol = get_nearest_option(atm, "CE")
-            pe_symbol = get_nearest_option(atm, "PE")
+            # New option symbols at new ATM
+            new_ce = get_nearest_option(atm, "CE")
+            new_pe = get_nearest_option(atm, "PE")
+            if not new_ce or not new_pe:
+                # If cannot re-enter safely, go flat
+                position_open = False
+                active_atm = None
+                ce_symbol = pe_symbol = None
+                ce_entry = pe_entry = None
+                last_snapshot_min = None
+                time.sleep(1)
+                continue
+
+            ce_symbol, pe_symbol = new_ce, new_pe
+
+            # LIVE ROLL ENTRY: BUY new CE/PE
+            stocko_open_long_straddle(ce_symbol, pe_symbol)
+
             ce_entry = ltp(ce_symbol)
             pe_entry = ltp(pe_symbol)
-
-            # LIVE: enter new legs
-            place_leg(ce_symbol, "BUY", QTY_PER_LEG, offset=201)
-            place_leg(pe_symbol, "BUY", QTY_PER_LEG, offset=202)
-
             active_atm = atm
             last_snapshot_min = None
 
@@ -445,9 +475,8 @@ while True:
                 )
 
             if unreal >= PROFIT_TARGET or unreal <= -STOP_LOSS:
-                # LIVE: exit legs
-                place_leg(ce_symbol, "SELL", QTY_PER_LEG, offset=301)
-                place_leg(pe_symbol, "SELL", QTY_PER_LEG, offset=302)
+                # LIVE FINAL EXIT: SELL CE/PE
+                stocko_close_long_straddle(ce_symbol, pe_symbol)
 
                 realized_pnl += unreal
                 position_open = False
