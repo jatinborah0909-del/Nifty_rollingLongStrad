@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-NIFTY LONG STRADDLE – SPOT – ATM ROLL READY
-=========================================
+NIFTY LONG STRADDLE – SPOT – FINAL (SCHEMA SAFE)
+==============================================
 ✔ BUY ATM CE + BUY ATM PE
 ✔ SNAPSHOT every minute
 ✔ Table: nifty_long_strang_roll
-✔ Timestamp column: timestamp
-✔ Kill switch: trade_flag.live_ls_nifty_spot
+✔ timestamp column: timestamp
+✔ Kill-switch: trade_flag.live_ls_nifty_spot
+✔ AUTO-FIXES wrong NUMERIC text columns
 ✔ PAPER + LIVE safe
 """
 
@@ -27,23 +28,23 @@ from kiteconnect import KiteConnect
 BOT_NAME = "LS_NIFTY_SPOT"
 MARKET_TZ = pytz.timezone("Asia/Kolkata")
 
-MARKET_OPEN = dt_time(9, 15)
+MARKET_OPEN  = dt_time(9, 15)
 MARKET_CLOSE = dt_time(15, 30)
-ENTRY_START = dt_time(9, 30)
-SQUARE_OFF = dt_time(15, 25)
+ENTRY_START  = dt_time(9, 30)
+SQUARE_OFF   = dt_time(15, 25)
 
 STRIKE_STEP = int(os.getenv("STRIKE_STEP", 50))
-ENTRY_TOL = int(os.getenv("ENTRY_TOL", 25))
-QTY = int(os.getenv("QTY_PER_LEG", 50))
+ENTRY_TOL   = int(os.getenv("ENTRY_TOL", 25))
+QTY         = int(os.getenv("QTY_PER_LEG", 50))
 
 SNAPSHOT_SEC = 60
 POLL_SEC = 1
 
-LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() in ("1","true","yes")
+LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() in ("1", "true", "yes")
 
 TABLE_NAME = "nifty_long_strang_roll"
 FLAG_TABLE = "trade_flag"
-FLAG_COL = "live_ls_nifty_spot"
+FLAG_COL   = "live_ls_nifty_spot"
 
 SPOT_INSTRUMENT = "NSE:NIFTY 50"
 
@@ -91,7 +92,7 @@ def ensure_table(conn):
         )
         """).format(t=sql.Identifier(TABLE_NAME)))
 
-        columns = {
+        typed_columns = {
             "bot_name": "TEXT",
             "event": "TEXT",
             "reason": "TEXT",
@@ -111,7 +112,7 @@ def ensure_table(conn):
             "pe_exit_price": "NUMERIC",
         }
 
-        for col, typ in columns.items():
+        for col, typ in typed_columns.items():
             c.execute(sql.SQL("""
                 ALTER TABLE {t}
                 ADD COLUMN IF NOT EXISTS {c} {typ}
@@ -121,6 +122,29 @@ def ensure_table(conn):
                 typ=sql.SQL(typ)
             ))
 
+    conn.commit()
+
+def force_text_columns(conn):
+    """FIX for legacy schema where text columns were wrongly NUMERIC"""
+    with conn.cursor() as c:
+        for col in ["bot_name", "event", "reason", "symbol", "side"]:
+            c.execute("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name = %s
+                      AND column_name = %s
+                      AND data_type <> 'text'
+                ) THEN
+                    EXECUTE format(
+                        'ALTER TABLE %I ALTER COLUMN %I TYPE TEXT USING %I::TEXT',
+                        %s, %s, %s
+                    );
+                END IF;
+            END $$;
+            """, (TABLE_NAME, col, TABLE_NAME, col, col))
     conn.commit()
 
 def log_db(conn, **k):
@@ -145,9 +169,12 @@ def log_db(conn, **k):
 
 def trade_allowed(conn):
     with conn.cursor() as c:
-        c.execute(sql.SQL("SELECT {c} FROM {t} LIMIT 1")
-                  .format(c=sql.Identifier(FLAG_COL),
-                          t=sql.Identifier(FLAG_TABLE)))
+        c.execute(sql.SQL(
+            "SELECT {c} FROM {t} LIMIT 1"
+        ).format(
+            c=sql.Identifier(FLAG_COL),
+            t=sql.Identifier(FLAG_TABLE)
+        ))
         r = c.fetchone()
         return bool(r[FLAG_COL]) if r else False
 
@@ -161,7 +188,7 @@ kite.set_access_token(KITE_ACCESS_TOKEN)
 def ltp(insts):
     try:
         q = kite.ltp(insts)
-        return {k:v["last_price"] for k,v in q.items()}
+        return {k: v["last_price"] for k, v in q.items()}
     except:
         return {}
 
@@ -172,18 +199,20 @@ def ltp(insts):
 def stocko(symbol, side, qty):
     if not LIVE_MODE:
         return
-    url = f"{STOCKO_BASE_URL}/api/v1/orders"
-    headers = {"Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}"}
-    payload = {
-        "exchange":"NFO",
-        "order_type":"MARKET",
-        "tradingsymbol":symbol,
-        "order_side":side,
-        "quantity":qty,
-        "product":"NRML",
-        "client_id":STOCKO_CLIENT_ID
-    }
-    requests.post(url, json=payload, headers=headers, timeout=10)
+    requests.post(
+        f"{STOCKO_BASE_URL}/api/v1/orders",
+        json={
+            "exchange": "NFO",
+            "order_type": "MARKET",
+            "tradingsymbol": symbol,
+            "order_side": side,
+            "quantity": qty,
+            "product": "NRML",
+            "client_id": STOCKO_CLIENT_ID
+        },
+        headers={"Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}"},
+        timeout=10
+    )
 
 # =========================================================
 # MAIN
@@ -192,6 +221,7 @@ def stocko(symbol, side, qty):
 def main():
     conn = db_conn()
     ensure_table(conn)
+    force_text_columns(conn)   # 🔥 THE FIX
 
     nfo = pd.DataFrame(kite.instruments("NFO"))
     nfo = nfo[nfo["name"] == "NIFTY"]
