@@ -2,14 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-NIFTY LONG STRADDLE – SPOT – FINAL (SCHEMA SAFE)
-==============================================
+NIFTY LONG STRADDLE – SPOT (CLEAN SCHEMA)
+=======================================
 ✔ BUY ATM CE + BUY ATM PE
 ✔ SNAPSHOT every minute
-✔ Table: nifty_long_strang_roll
-✔ timestamp column: timestamp
+✔ Table: nifty_long_strang_roll (fresh)
+✔ timestamp column
 ✔ Kill-switch: trade_flag.live_ls_nifty_spot
-✔ AUTO-FIXES wrong NUMERIC text columns
 ✔ PAPER + LIVE safe
 """
 
@@ -40,7 +39,7 @@ QTY         = int(os.getenv("QTY_PER_LEG", 50))
 SNAPSHOT_SEC = 60
 POLL_SEC = 1
 
-LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() in ("1", "true", "yes")
+LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() in ("1","true","yes")
 
 TABLE_NAME = "nifty_long_strang_roll"
 FLAG_TABLE = "trade_flag"
@@ -66,100 +65,61 @@ def db_conn():
         cursor_factory=RealDictCursor
     )
 
-def ensure_table(conn):
+def create_table_fresh(conn):
     with conn.cursor() as c:
         c.execute(sql.SQL("""
         CREATE TABLE IF NOT EXISTS {t} (
             id SERIAL PRIMARY KEY,
             timestamp TIMESTAMPTZ NOT NULL,
-            bot_name TEXT,
-            event TEXT,
+
+            bot_name TEXT NOT NULL,
+            event TEXT NOT NULL,
             reason TEXT,
+
             symbol TEXT,
             side TEXT,
             qty INTEGER,
             price NUMERIC,
+
             spot NUMERIC,
-            atr NUMERIC,
             unreal_pnl NUMERIC,
             total_pnl NUMERIC,
+
             ce_entry_price NUMERIC,
             pe_entry_price NUMERIC,
             ce_ltp NUMERIC,
             pe_ltp NUMERIC,
             ce_exit_price NUMERIC,
             pe_exit_price NUMERIC
-        )
+        );
         """).format(t=sql.Identifier(TABLE_NAME)))
 
-        typed_columns = {
-            "bot_name": "TEXT",
-            "event": "TEXT",
-            "reason": "TEXT",
-            "symbol": "TEXT",
-            "side": "TEXT",
-            "qty": "INTEGER",
-            "price": "NUMERIC",
-            "spot": "NUMERIC",
-            "atr": "NUMERIC",
-            "unreal_pnl": "NUMERIC",
-            "total_pnl": "NUMERIC",
-            "ce_entry_price": "NUMERIC",
-            "pe_entry_price": "NUMERIC",
-            "ce_ltp": "NUMERIC",
-            "pe_ltp": "NUMERIC",
-            "ce_exit_price": "NUMERIC",
-            "pe_exit_price": "NUMERIC",
-        }
+        # Useful indexes
+        c.execute(sql.SQL(
+            "CREATE INDEX IF NOT EXISTS idx_{t}_ts ON {t}(timestamp DESC)"
+        ).format(t=sql.Identifier(TABLE_NAME)))
 
-        for col, typ in typed_columns.items():
-            c.execute(sql.SQL("""
-                ALTER TABLE {t}
-                ADD COLUMN IF NOT EXISTS {c} {typ}
-            """).format(
-                t=sql.Identifier(TABLE_NAME),
-                c=sql.Identifier(col),
-                typ=sql.SQL(typ)
-            ))
+        c.execute(sql.SQL(
+            "CREATE INDEX IF NOT EXISTS idx_{t}_event ON {t}(event)"
+        ).format(t=sql.Identifier(TABLE_NAME)))
 
-    conn.commit()
-
-def force_text_columns(conn):
-    """FIX for legacy schema where text columns were wrongly NUMERIC"""
-    with conn.cursor() as c:
-        for col in ["bot_name", "event", "reason", "symbol", "side"]:
-            c.execute("""
-            DO $$
-            BEGIN
-                IF EXISTS (
-                    SELECT 1
-                    FROM information_schema.columns
-                    WHERE table_name = %s
-                      AND column_name = %s
-                      AND data_type <> 'text'
-                ) THEN
-                    EXECUTE format(
-                        'ALTER TABLE %I ALTER COLUMN %I TYPE TEXT USING %I::TEXT',
-                        %s, %s, %s
-                    );
-                END IF;
-            END $$;
-            """, (TABLE_NAME, col, TABLE_NAME, col, col))
     conn.commit()
 
 def log_db(conn, **k):
     with conn.cursor() as c:
         c.execute(sql.SQL("""
         INSERT INTO {t} (
-            timestamp, bot_name, event, reason, symbol, side,
-            qty, price, spot, atr, unreal_pnl, total_pnl,
+            timestamp, bot_name, event, reason,
+            symbol, side, qty, price,
+            spot, unreal_pnl, total_pnl,
             ce_entry_price, pe_entry_price,
             ce_ltp, pe_ltp,
             ce_exit_price, pe_exit_price
         )
         VALUES (
-            NOW(), %(bot)s, %(event)s, %(reason)s, %(symbol)s, %(side)s,
-            %(qty)s, %(price)s, %(spot)s, %(atr)s, %(unreal)s, %(total)s,
+            NOW(), %(bot)s, %(event)s, %(reason)s,
+            %(symbol)s, %(side)s, %(qty)s, %(price)s,
+            %(spot)s, %(unreal)s, %(total)s,
             %(ce_entry)s, %(pe_entry)s,
             %(ce_ltp)s, %(pe_ltp)s,
             %(ce_exit)s, %(pe_exit)s
@@ -220,8 +180,7 @@ def stocko(symbol, side, qty):
 
 def main():
     conn = db_conn()
-    ensure_table(conn)
-    force_text_columns(conn)   # 🔥 THE FIX
+    create_table_fresh(conn)
 
     nfo = pd.DataFrame(kite.instruments("NFO"))
     nfo = nfo[nfo["name"] == "NIFTY"]
@@ -266,7 +225,6 @@ def main():
                 qty=0,
                 price=0,
                 spot=spot,
-                atr=None,
                 unreal=unreal,
                 total=unreal,
                 ce_entry=pos.get("CE", {}).get("entry"),
