@@ -2,17 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-NIFTY LONG STRADDLE – SPOT (CLEAN SCHEMA)
-=======================================
+NIFTY LONG STRADDLE – SPOT (CLEAN SCHEMA, NO INDEX)
+=================================================
 ✔ BUY ATM CE + BUY ATM PE
 ✔ SNAPSHOT every minute
-✔ Table: nifty_long_strang_roll (fresh)
-✔ timestamp column
+✔ Table: nifty_long_strang_roll (fresh, simple)
 ✔ Kill-switch: trade_flag.live_ls_nifty_spot
 ✔ PAPER + LIVE safe
 """
 
-import os, time, math, pytz, requests
+import os, time, pytz, requests
 from datetime import datetime, time as dt_time
 import pandas as pd
 import psycopg2
@@ -39,7 +38,7 @@ QTY         = int(os.getenv("QTY_PER_LEG", 50))
 SNAPSHOT_SEC = 60
 POLL_SEC = 1
 
-LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() in ("1","true","yes")
+LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() in ("1", "true", "yes")
 
 TABLE_NAME = "nifty_long_strang_roll"
 FLAG_TABLE = "trade_flag"
@@ -93,16 +92,6 @@ def create_table_fresh(conn):
             pe_exit_price NUMERIC
         );
         """).format(t=sql.Identifier(TABLE_NAME)))
-
-        # Useful indexes
-        c.execute(sql.SQL(
-            "CREATE INDEX IF NOT EXISTS idx_{t}_ts ON {t}(timestamp DESC)"
-        ).format(t=sql.Identifier(TABLE_NAME)))
-
-        c.execute(sql.SQL(
-            "CREATE INDEX IF NOT EXISTS idx_{t}_event ON {t}(event)"
-        ).format(t=sql.Identifier(TABLE_NAME)))
-
     conn.commit()
 
 def log_db(conn, **k):
@@ -149,7 +138,7 @@ def ltp(insts):
     try:
         q = kite.ltp(insts)
         return {k: v["last_price"] for k, v in q.items()}
-    except:
+    except Exception:
         return {}
 
 # =========================================================
@@ -203,7 +192,7 @@ def main():
 
         atm = int(round(spot / STRIKE_STEP) * STRIKE_STEP)
 
-        # ---- SNAPSHOT ----
+        # ---------- SNAPSHOT ----------
         if time.time() - last_snap >= SNAPSHOT_SEC:
             allowed = trade_allowed(conn)
             unreal = 0.0
@@ -242,13 +231,13 @@ def main():
 
             last_snap = time.time()
 
-        # ---- TIME EXIT ----
+        # ---------- TIME EXIT ----------
         if now.time() >= SQUARE_OFF and pos:
             stocko(ce_ts, "SELL", QTY)
             stocko(pe_ts, "SELL", QTY)
             break
 
-        # ---- ENTRY ----
+        # ---------- ENTRY ----------
         if not pos and abs(spot - atm) <= ENTRY_TOL and trade_allowed(conn):
             opt = nfo[
                 (nfo["strike"] == atm) &
