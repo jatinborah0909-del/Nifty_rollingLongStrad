@@ -166,21 +166,33 @@ def get_vix():
 
 def stocko(symbol, side, qty):
     if not LIVE_MODE:
+        print("🟡 STOCKO SKIPPED (LIVE_MODE=False)")
         return
-    requests.post(
-        f"{STOCKO_BASE_URL}/api/v1/orders",
-        json={
-            "exchange": "NFO",
-            "order_type": "MARKET",
-            "tradingsymbol": symbol,
-            "order_side": side,
-            "quantity": qty,
-            "product": "NRML",
-            "client_id": STOCKO_CLIENT_ID
-        },
-        headers={"Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}"},
-        timeout=10
-    )
+
+    payload = {
+        "exchange": "NFO",
+        "order_type": "MARKET",
+        "tradingsymbol": symbol,
+        "order_side": side,
+        "quantity": qty,
+        "product": "MIS",   # IMPORTANT (see below)
+        "client_id": STOCKO_CLIENT_ID
+    }
+
+    try:
+        r = requests.post(
+            f"{STOCKO_BASE_URL}/api/v1/orders",
+            json=payload,
+            headers={"Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}"},
+            timeout=10
+        )
+
+        print("🧾 STOCKO ORDER", symbol, side, qty)
+        print("🧾 STATUS:", r.status_code)
+        print("🧾 RESPONSE:", r.text)
+
+    except Exception as e:
+        print("❌ STOCKO EXCEPTION:", e)
 
 # =========================================================
 # MAIN
