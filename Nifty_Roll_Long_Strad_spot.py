@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-NIFTY LONG STRADDLE – SPOT (CLEAN SCHEMA, NO INDEX)
+NIFTY LONG STRADDLE – SPOT (CLEAN SCHEMA, WITH VIX)
 =================================================
 ✔ BUY ATM CE + BUY ATM PE
 ✔ SNAPSHOT every minute
 ✔ Table: nifty_long_strang_roll (fresh, simple)
 ✔ Kill-switch: trade_flag.live_ls_nifty_spot
 ✔ PAPER + LIVE safe
+✔ India VIX logged (prev close + live)
 """
 
 import os, time, pytz, requests
@@ -45,6 +46,7 @@ FLAG_TABLE = "trade_flag"
 FLAG_COL   = "live_ls_nifty_spot"
 
 SPOT_INSTRUMENT = "NSE:NIFTY 50"
+VIX_INSTRUMENT  = "NSE:INDIA VIX"
 
 KITE_API_KEY = os.getenv("KITE_API_KEY")
 KITE_ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN")
@@ -81,6 +83,9 @@ def create_table_fresh(conn):
             price NUMERIC,
 
             spot NUMERIC,
+            vix_prev NUMERIC,
+            vix NUMERIC,
+
             unreal_pnl NUMERIC,
             total_pnl NUMERIC,
 
@@ -100,7 +105,8 @@ def log_db(conn, **k):
         INSERT INTO {t} (
             timestamp, bot_name, event, reason,
             symbol, side, qty, price,
-            spot, unreal_pnl, total_pnl,
+            spot, vix_prev, vix,
+            unreal_pnl, total_pnl,
             ce_entry_price, pe_entry_price,
             ce_ltp, pe_ltp,
             ce_exit_price, pe_exit_price
@@ -108,7 +114,8 @@ def log_db(conn, **k):
         VALUES (
             NOW(), %(bot)s, %(event)s, %(reason)s,
             %(symbol)s, %(side)s, %(qty)s, %(price)s,
-            %(spot)s, %(unreal)s, %(total)s,
+            %(spot)s, %(vix_prev)s, %(vix)s,
+            %(unreal)s, %(total)s,
             %(ce_entry)s, %(pe_entry)s,
             %(ce_ltp)s, %(pe_ltp)s,
             %(ce_exit)s, %(pe_exit)s
@@ -118,12 +125,12 @@ def log_db(conn, **k):
 
 def trade_allowed(conn):
     with conn.cursor() as c:
-        c.execute(sql.SQL(
-            "SELECT {c} FROM {t} LIMIT 1"
-        ).format(
-            c=sql.Identifier(FLAG_COL),
-            t=sql.Identifier(FLAG_TABLE)
-        ))
+        c.execute(
+            sql.SQL("SELECT {c} FROM {t} LIMIT 1").format(
+                c=sql.Identifier(FLAG_COL),
+                t=sql.Identifier(FLAG_TABLE)
+            )
+        )
         r = c.fetchone()
         return bool(r[FLAG_COL]) if r else False
 
@@ -140,6 +147,16 @@ def ltp(insts):
         return {k: v["last_price"] for k, v in q.items()}
     except Exception:
         return {}
+
+def get_vix():
+    try:
+        q = kite.quote([VIX_INSTRUMENT])
+        d = q[VIX_INSTRUMENT]
+        vix_prev = float(d["ohlc"]["close"]) if d.get("ohlc") else None
+        vix = float(d["last_price"]) if d.get("last_price") is not None else None
+        return vix_prev, vix
+    except Exception:
+        return None, None
 
 # =========================================================
 # STOCKO
@@ -190,6 +207,7 @@ def main():
             time.sleep(POLL_SEC)
             continue
 
+        vix_prev, vix = get_vix()
         atm = int(round(spot / STRIKE_STEP) * STRIKE_STEP)
 
         # ---------- SNAPSHOT ----------
@@ -214,6 +232,8 @@ def main():
                 qty=0,
                 price=0,
                 spot=spot,
+                vix_prev=vix_prev,
+                vix=vix,
                 unreal=unreal,
                 total=unreal,
                 ce_entry=pos.get("CE", {}).get("entry"),
