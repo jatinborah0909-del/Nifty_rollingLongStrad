@@ -2,16 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-NIFTY LONG STRADDLE – SPOT (LIVE SAFE, STOCKO FIXED)
-===================================================
+NIFTY LONG STRADDLE – SPOT (LIVE SAFE, STOCKO FIXED + KILL-SWITCH EXIT)
+======================================================================
 ✔ BUY ATM CE + BUY ATM PE
 ✔ SNAPSHOT every minute
 ✔ Kill-switch: trade_flag.live_ls_nifty_spot
+    - If FALSE while position OPEN -> immediate square-off + halt
+    - Resume when TRUE again (and no positions)
 ✔ PAPER + LIVE safe
 ✔ NO fake PnL (pos created only if Stocko succeeds)
 """
 
-import os, time, pytz, requests, math
+import os, time, pytz, requests
 from datetime import datetime, time as dt_time
 import pandas as pd
 import psycopg2
@@ -46,12 +48,12 @@ FLAG_COL   = "live_ls_nifty_spot"
 
 SPOT_INSTRUMENT = "NSE:NIFTY 50"
 
-KITE_API_KEY = os.getenv("KITE_API_KEY")
-KITE_ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN")
+KITE_API_KEY = os.getenv("KITE_API_KEY", "").strip()
+KITE_ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", "").strip()
 
-STOCKO_BASE_URL = os.getenv("STOCKO_BASE_URL", "https://api.stocko.in")
-STOCKO_ACCESS_TOKEN = os.getenv("STOCKO_ACCESS_TOKEN")
-STOCKO_CLIENT_ID = os.getenv("STOCKO_CLIENT_ID")
+STOCKO_BASE_URL = os.getenv("STOCKO_BASE_URL", "https://api.stocko.in").strip()
+STOCKO_ACCESS_TOKEN = os.getenv("STOCKO_ACCESS_TOKEN", "").strip()
+STOCKO_CLIENT_ID = os.getenv("STOCKO_CLIENT_ID", "").strip()
 
 # =========================================================
 # DB
@@ -92,9 +94,7 @@ def log_db(conn, **k):
 
 def trade_allowed(conn):
     with conn.cursor() as c:
-        c.execute(sql.SQL(
-            "SELECT {c} FROM {t} LIMIT 1"
-        ).format(
+        c.execute(sql.SQL("SELECT {c} FROM {t} LIMIT 1").format(
             c=sql.Identifier(FLAG_COL),
             t=sql.Identifier(FLAG_TABLE)
         ))
@@ -113,42 +113,29 @@ def ltp(insts):
     return {k: v["last_price"] for k, v in q.items()}
 
 # =========================================================
-# STOCKO (WORKING LOGIC – COPIED FROM SS BOT)
+# STOCKO (WORKING LOGIC)
 # =========================================================
 
 def _stocko_headers():
     return {"Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}"}
 
-def stocko_search_token(tradingsymbol: str) -> int:
-    r = requests.get(
-        f"{STOCKO_BASE_URL}/api/v1/search",
-        params={"key": tradingsymbol},
-        headers=_stocko_headers(),
-        timeout=10
-    )
-    r.raise_for_status()
-    data = r.json()
-    result = data.get("result") or data.get("data", {}).get("result", [])
-    for rec in result:
-        if rec.get("exchange") == "NFO":
-            return int(rec["token"])
-    raise RuntimeError(f"Stocko token not found for {tradingsymbol}")
-
-def _gen_user_order_id(offset=0) -> str:
-    return str(int(time.time() * 1000) + offset)[-15:]
-
 def stocko_place_by_tradingsymbol(tradingsymbol: str, side: str, qty: int, offset=0):
+    """
+    Places MARKET order in LIVE_MODE using Stocko:
+      - search token via /search?key=<tsym>
+      - place order via instrument_token with required fields
+    """
     if not LIVE_MODE:
         return {"simulated": True}
 
     if not STOCKO_ACCESS_TOKEN or not STOCKO_CLIENT_ID:
         raise RuntimeError("LIVE_MODE=True but STOCKO creds missing.")
 
-    # ---- search token (same as SS bot) ----
+    # search token
     r = requests.get(
         f"{STOCKO_BASE_URL}/api/v1/search",
         params={"key": tradingsymbol},
-        headers={"Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}"},
+        headers=_stocko_headers(),
         timeout=10
     )
     r.raise_for_status()
@@ -160,11 +147,9 @@ def stocko_place_by_tradingsymbol(tradingsymbol: str, side: str, qty: int, offse
         if rec.get("exchange") == "NFO":
             token = rec.get("token")
             break
-
     if token is None:
         raise RuntimeError(f"Stocko token not found for {tradingsymbol}")
 
-    # ---- FULL payload (MANDATORY FIELDS) ----
     payload = {
         "exchange": "NFO",
         "order_type": "MARKET",
@@ -174,28 +159,25 @@ def stocko_place_by_tradingsymbol(tradingsymbol: str, side: str, qty: int, offse
         "order_side": side.upper(),
         "price": 0,
         "trigger_price": 0,
-        "validity": "DAY",                     # 🔥 REQUIRED
-        "product": "MIS",                      # intraday
+        "validity": "DAY",
+        "product": "MIS",
         "client_id": STOCKO_CLIENT_ID,
         "user_order_id": str(int(time.time() * 1000) + offset)[-15:],
-        "market_protection_percentage": 0,     # 🔥 REQUIRED
-        "device": "WEB"                        # 🔥 REQUIRED
+        "market_protection_percentage": 0,
+        "device": "WEB"
     }
 
     r = requests.post(
         f"{STOCKO_BASE_URL}/api/v1/orders",
         json=payload,
-        headers={"Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}"},
+        headers=_stocko_headers(),
         timeout=10
     )
-
-    print("🧾 STOCKO", side, tradingsymbol, r.status_code, r.text)
-
+    print("🧾 STOCKO", side.upper(), tradingsymbol, r.status_code, r.text)
     if r.status_code != 200:
         raise RuntimeError(r.text)
 
     return r.json()
-
 
 # =========================================================
 # MAIN
@@ -208,26 +190,35 @@ def main():
     nfo = pd.DataFrame(kite.instruments("NFO"))
     nfo = nfo[nfo["name"] == "NIFTY"]
 
-    pos = {}
+    pos = {}                 # {"CE": entry_price, "PE": entry_price}
     ce_ts = pe_ts = None
     last_snap = 0
+
+    halted = False           # halt entries after FLAG_FALSE until flag becomes True
 
     print(f"🚀 STARTED | LIVE_MODE={LIVE_MODE}")
 
     while True:
         now = datetime.now(MARKET_TZ)
 
+        # session guard
         if now.time() < MARKET_OPEN or now.time() > MARKET_CLOSE:
             time.sleep(30)
             continue
 
         spot = ltp([SPOT_INSTRUMENT]).get(SPOT_INSTRUMENT)
+        if not spot:
+            time.sleep(POLL_SEC)
+            continue
+
         atm = int(round(spot / STRIKE_STEP) * STRIKE_STEP)
 
-        # ---------- SNAPSHOT ----------
+        # ---------- SNAPSHOT + FLAG ENFORCEMENT ----------
         if time.time() - last_snap >= SNAPSHOT_SEC:
+            allowed = trade_allowed(conn)
+
             unreal = 0.0
-            if pos:
+            if pos and ce_ts and pe_ts:
                 l = ltp([f"NFO:{ce_ts}", f"NFO:{pe_ts}"])
                 unreal = (
                     (l[f"NFO:{ce_ts}"] - pos["CE"]) +
@@ -238,43 +229,94 @@ def main():
                 conn,
                 bot=BOT_NAME,
                 event="SNAPSHOT",
-                reason=f"FLAG={trade_allowed(conn)}",
+                reason=f"FLAG={allowed},HALT={halted}",
                 spot=spot,
                 unreal=unreal,
                 ce=pos.get("CE"),
                 pe=pos.get("PE"),
             )
+
+            # ✅ Kill-switch enforcement: if FALSE and position exists -> square off now
+            if (not allowed) and pos and ce_ts and pe_ts:
+                try:
+                    stocko_place_by_tradingsymbol(ce_ts, "SELL", QTY, 901)
+                    stocko_place_by_tradingsymbol(pe_ts, "SELL", QTY, 902)
+                    print("🛑 FLAG FALSE -> SQUARED OFF")
+                except Exception as e:
+                    print("❌ FLAG EXIT FAILED:", e)
+
+                # log exit event (best-effort)
+                log_db(
+                    conn,
+                    bot=BOT_NAME,
+                    event="EXIT",
+                    reason="FLAG_FALSE_SQUAREOFF",
+                    spot=spot,
+                    unreal=unreal,
+                    ce=pos.get("CE"),
+                    pe=pos.get("PE"),
+                )
+
+                pos.clear()
+                ce_ts = pe_ts = None
+                halted = True  # don’t re-enter until flag becomes True again
+
+            # resume when flag becomes true again
+            if allowed and halted and not pos:
+                halted = False
+                log_db(
+                    conn,
+                    bot=BOT_NAME,
+                    event="RESUME",
+                    reason="FLAG_TRUE_RESUME",
+                    spot=spot,
+                    unreal=0.0,
+                    ce=None,
+                    pe=None,
+                )
+
             last_snap = time.time()
 
         # ---------- TIME EXIT ----------
-        if now.time() >= SQUARE_OFF and pos:
+        if now.time() >= SQUARE_OFF and pos and ce_ts and pe_ts:
             stocko_place_by_tradingsymbol(ce_ts, "SELL", QTY, 101)
             stocko_place_by_tradingsymbol(pe_ts, "SELL", QTY, 102)
             print("⏹ 15:25 EXIT")
             break
 
         # ---------- ENTRY ----------
-        if not pos and trade_allowed(conn) and abs(spot - atm) <= ENTRY_TOL and now.time() >= ENTRY_START:
-            opt = nfo[(nfo["strike"] == atm) & (nfo["instrument_type"].isin(["CE", "PE"]))]
-            expiry = min(pd.to_datetime(opt["expiry"]).dt.date)
+        if halted:
+            time.sleep(POLL_SEC)
+            continue
 
-            ce_ts = opt[(opt["instrument_type"] == "CE") & (pd.to_datetime(opt["expiry"]).dt.date == expiry)].iloc[0]["tradingsymbol"]
-            pe_ts = opt[(opt["instrument_type"] == "PE") & (pd.to_datetime(opt["expiry"]).dt.date == expiry)].iloc[0]["tradingsymbol"]
+        if (not pos) and (now.time() >= ENTRY_START):
+            allowed_now = trade_allowed(conn)
+            if allowed_now and abs(spot - atm) <= ENTRY_TOL:
+                opt = nfo[(nfo["strike"] == atm) & (nfo["instrument_type"].isin(["CE", "PE"]))]
+                if opt.empty:
+                    time.sleep(POLL_SEC)
+                    continue
 
-            l = ltp([f"NFO:{ce_ts}", f"NFO:{pe_ts}"])
-            ce_p, pe_p = l[f"NFO:{ce_ts}"], l[f"NFO:{pe_ts}"]
+                expiry = min(pd.to_datetime(opt["expiry"]).dt.date)
 
-            try:
-                stocko_place_by_tradingsymbol(ce_ts, "BUY", QTY, 1)
-                stocko_place_by_tradingsymbol(pe_ts, "BUY", QTY, 2)
-            except Exception as e:
-                print("❌ ENTRY FAILED:", e)
-                time.sleep(POLL_SEC)
-                continue
+                ce_ts = opt[(opt["instrument_type"] == "CE") & (pd.to_datetime(opt["expiry"]).dt.date == expiry)].iloc[0]["tradingsymbol"]
+                pe_ts = opt[(opt["instrument_type"] == "PE") & (pd.to_datetime(opt["expiry"]).dt.date == expiry)].iloc[0]["tradingsymbol"]
 
-            pos["CE"] = ce_p
-            pos["PE"] = pe_p
-            print("✅ LIVE ENTRY EXECUTED")
+                l = ltp([f"NFO:{ce_ts}", f"NFO:{pe_ts}"])
+                ce_p, pe_p = l[f"NFO:{ce_ts}"], l[f"NFO:{pe_ts}"]
+
+                try:
+                    stocko_place_by_tradingsymbol(ce_ts, "BUY", QTY, 1)
+                    stocko_place_by_tradingsymbol(pe_ts, "BUY", QTY, 2)
+                except Exception as e:
+                    print("❌ ENTRY FAILED:", e)
+                    ce_ts = pe_ts = None
+                    time.sleep(POLL_SEC)
+                    continue
+
+                pos["CE"] = ce_p
+                pos["PE"] = pe_p
+                print("✅ LIVE ENTRY EXECUTED")
 
         time.sleep(POLL_SEC)
 
