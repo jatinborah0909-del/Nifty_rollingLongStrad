@@ -39,7 +39,9 @@ QTY         = int(os.getenv("QTY_PER_LEG", 50))
 SNAPSHOT_SEC = 60
 POLL_SEC = 1
 
-LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() in ("1", "true", "yes")
+LIVE_MODE = os.getenv("LIVE_MODE", "false").strip().lower() in ("1", "true", "yes")
+print("🔎 LIVE_MODE =", LIVE_MODE, "| RAW =", os.getenv("LIVE_MODE"))
+
 
 TABLE_NAME = "nifty_long_strang_roll"
 FLAG_TABLE = "trade_flag"
