@@ -137,34 +137,65 @@ def stocko_search_token(tradingsymbol: str) -> int:
 def _gen_user_order_id(offset=0) -> str:
     return str(int(time.time() * 1000) + offset)[-15:]
 
-def stocko_place_by_tradingsymbol(tsym: str, side: str, qty: int, offset=0):
+def stocko_place_by_tradingsymbol(tradingsymbol: str, side: str, qty: int, offset=0):
     if not LIVE_MODE:
-        return True
+        return {"simulated": True}
 
-    tok = stocko_search_token(tsym)
+    if not STOCKO_ACCESS_TOKEN or not STOCKO_CLIENT_ID:
+        raise RuntimeError("LIVE_MODE=True but STOCKO creds missing.")
 
+    # ---- search token (same as SS bot) ----
+    r = requests.get(
+        f"{STOCKO_BASE_URL}/api/v1/search",
+        params={"key": tradingsymbol},
+        headers={"Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}"},
+        timeout=10
+    )
+    r.raise_for_status()
+    data = r.json()
+    result = data.get("result") or data.get("data", {}).get("result", [])
+
+    token = None
+    for rec in result:
+        if rec.get("exchange") == "NFO":
+            token = rec.get("token")
+            break
+
+    if token is None:
+        raise RuntimeError(f"Stocko token not found for {tradingsymbol}")
+
+    # ---- FULL payload (MANDATORY FIELDS) ----
     payload = {
         "exchange": "NFO",
         "order_type": "MARKET",
-        "instrument_token": tok,
-        "quantity": qty,
-        "order_side": side,
-        "product": "MIS",
+        "instrument_token": int(token),
+        "quantity": int(qty),
+        "disclosed_quantity": 0,
+        "order_side": side.upper(),
+        "price": 0,
+        "trigger_price": 0,
+        "validity": "DAY",                     # 🔥 REQUIRED
+        "product": "MIS",                      # intraday
         "client_id": STOCKO_CLIENT_ID,
-        "user_order_id": _gen_user_order_id(offset),
+        "user_order_id": str(int(time.time() * 1000) + offset)[-15:],
+        "market_protection_percentage": 0,     # 🔥 REQUIRED
+        "device": "WEB"                        # 🔥 REQUIRED
     }
 
     r = requests.post(
         f"{STOCKO_BASE_URL}/api/v1/orders",
         json=payload,
-        headers=_stocko_headers(),
+        headers={"Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}"},
         timeout=10
     )
 
-    print("🧾 STOCKO", side, tsym, r.status_code, r.text)
+    print("🧾 STOCKO", side, tradingsymbol, r.status_code, r.text)
+
     if r.status_code != 200:
         raise RuntimeError(r.text)
-    return True
+
+    return r.json()
+
 
 # =========================================================
 # MAIN
