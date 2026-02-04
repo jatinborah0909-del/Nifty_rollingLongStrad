@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-NIFTY LONG STRADDLE – SPOT (CLEAN SCHEMA, WITH VIX)
-=================================================
+NIFTY LONG STRADDLE – SPOT (LIVE SAFE, STOCKO FIXED)
+===================================================
 ✔ BUY ATM CE + BUY ATM PE
 ✔ SNAPSHOT every minute
-✔ Table: nifty_long_strang_roll (fresh, simple)
 ✔ Kill-switch: trade_flag.live_ls_nifty_spot
 ✔ PAPER + LIVE safe
-✔ India VIX logged (prev close + live)
+✔ India VIX logged
+✔ Stocko instrument_token based execution (FIXED)
+✔ No fake PnL (pos only if LIVE orders succeed)
 """
 
 import os, time, pytz, requests
@@ -40,8 +41,6 @@ SNAPSHOT_SEC = 60
 POLL_SEC = 1
 
 LIVE_MODE = os.getenv("LIVE_MODE", "false").strip().lower() in ("1", "true", "yes")
-print("🔎 LIVE_MODE =", LIVE_MODE, "| RAW =", os.getenv("LIVE_MODE"))
-
 
 TABLE_NAME = "nifty_long_strang_roll"
 FLAG_TABLE = "trade_flag"
@@ -74,29 +73,14 @@ def create_table_fresh(conn):
         CREATE TABLE IF NOT EXISTS {t} (
             id SERIAL PRIMARY KEY,
             timestamp TIMESTAMPTZ NOT NULL,
-
-            bot_name TEXT NOT NULL,
-            event TEXT NOT NULL,
+            bot_name TEXT,
+            event TEXT,
             reason TEXT,
-
-            symbol TEXT,
-            side TEXT,
-            qty INTEGER,
-            price NUMERIC,
-
             spot NUMERIC,
             vix_prev NUMERIC,
             vix NUMERIC,
-
             unreal_pnl NUMERIC,
-            total_pnl NUMERIC,
-
-            ce_entry_price NUMERIC,
-            pe_entry_price NUMERIC,
-            ce_ltp NUMERIC,
-            pe_ltp NUMERIC,
-            ce_exit_price NUMERIC,
-            pe_exit_price NUMERIC
+            total_pnl NUMERIC
         );
         """).format(t=sql.Identifier(TABLE_NAME)))
     conn.commit()
@@ -106,21 +90,13 @@ def log_db(conn, **k):
         c.execute(sql.SQL("""
         INSERT INTO {t} (
             timestamp, bot_name, event, reason,
-            symbol, side, qty, price,
             spot, vix_prev, vix,
-            unreal_pnl, total_pnl,
-            ce_entry_price, pe_entry_price,
-            ce_ltp, pe_ltp,
-            ce_exit_price, pe_exit_price
+            unreal_pnl, total_pnl
         )
         VALUES (
             NOW(), %(bot)s, %(event)s, %(reason)s,
-            %(symbol)s, %(side)s, %(qty)s, %(price)s,
             %(spot)s, %(vix_prev)s, %(vix)s,
-            %(unreal)s, %(total)s,
-            %(ce_entry)s, %(pe_entry)s,
-            %(ce_ltp)s, %(pe_ltp)s,
-            %(ce_exit)s, %(pe_exit)s
+            %(unreal)s, %(total)s
         )
         """).format(t=sql.Identifier(TABLE_NAME)), k)
     conn.commit()
@@ -154,45 +130,54 @@ def get_vix():
     try:
         q = kite.quote([VIX_INSTRUMENT])
         d = q[VIX_INSTRUMENT]
-        vix_prev = float(d["ohlc"]["close"]) if d.get("ohlc") else None
-        vix = float(d["last_price"]) if d.get("last_price") is not None else None
-        return vix_prev, vix
+        return float(d["ohlc"]["close"]), float(d["last_price"])
     except Exception:
         return None, None
 
 # =========================================================
-# STOCKO
+# STOCKO (FIXED)
 # =========================================================
 
-def stocko(symbol, side, qty):
+def stocko_token(symbol):
+    r = requests.get(
+        f"{STOCKO_BASE_URL}/api/v1/search",
+        params={"query": symbol, "exchange": "NFO"},
+        headers={"Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}"},
+        timeout=10
+    )
+    if r.status_code != 200:
+        return None
+    data = r.json().get("data", [])
+    return data[0]["instrument_token"] if data else None
+
+def stocko_order(symbol, side, qty):
     if not LIVE_MODE:
-        print("🟡 STOCKO SKIPPED (LIVE_MODE=False)")
-        return
+        return True
+
+    token = stocko_token(symbol)
+    if not token:
+        print("❌ STOCKO TOKEN FAIL:", symbol)
+        return False
 
     payload = {
         "exchange": "NFO",
+        "instrument_token": token,
         "order_type": "MARKET",
-        "tradingsymbol": symbol,
         "order_side": side,
         "quantity": qty,
-        "product": "MIS",   # IMPORTANT (see below)
+        "product": "MIS",
         "client_id": STOCKO_CLIENT_ID
     }
 
-    try:
-        r = requests.post(
-            f"{STOCKO_BASE_URL}/api/v1/orders",
-            json=payload,
-            headers={"Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}"},
-            timeout=10
-        )
+    r = requests.post(
+        f"{STOCKO_BASE_URL}/api/v1/orders",
+        json=payload,
+        headers={"Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}"},
+        timeout=10
+    )
 
-        print("🧾 STOCKO ORDER", symbol, side, qty)
-        print("🧾 STATUS:", r.status_code)
-        print("🧾 RESPONSE:", r.text)
-
-    except Exception as e:
-        print("❌ STOCKO EXCEPTION:", e)
+    print("🧾 STOCKO", side, symbol, r.status_code, r.text)
+    return r.status_code == 200
 
 # =========================================================
 # MAIN
@@ -208,6 +193,8 @@ def main():
     pos = {}
     ce_ts = pe_ts = None
     last_snap = 0
+
+    print(f"🚀 STARTED | LIVE_MODE={LIVE_MODE}")
 
     while True:
         now = datetime.now(MARKET_TZ)
@@ -226,77 +213,57 @@ def main():
 
         # ---------- SNAPSHOT ----------
         if time.time() - last_snap >= SNAPSHOT_SEC:
-            allowed = trade_allowed(conn)
             unreal = 0.0
-
             if pos:
                 l = ltp([f"NFO:{ce_ts}", f"NFO:{pe_ts}"])
                 unreal = (
-                    (l[f"NFO:{ce_ts}"] - pos["CE"]["entry"]) +
-                    (l[f"NFO:{pe_ts}"] - pos["PE"]["entry"])
+                    (l[f"NFO:{ce_ts}"] - pos["CE"]) +
+                    (l[f"NFO:{pe_ts}"] - pos["PE"])
                 ) * QTY
 
             log_db(
                 conn,
                 bot=BOT_NAME,
                 event="SNAPSHOT",
-                reason=f"FLAG={allowed}",
-                symbol="NIFTY",
-                side="NA",
-                qty=0,
-                price=0,
+                reason=f"FLAG={trade_allowed(conn)}",
                 spot=spot,
                 vix_prev=vix_prev,
                 vix=vix,
                 unreal=unreal,
-                total=unreal,
-                ce_entry=pos.get("CE", {}).get("entry"),
-                pe_entry=pos.get("PE", {}).get("entry"),
-                ce_ltp=None,
-                pe_ltp=None,
-                ce_exit=None,
-                pe_exit=None
+                total=unreal
             )
-
-            if not allowed and pos:
-                stocko(ce_ts, "SELL", QTY)
-                stocko(pe_ts, "SELL", QTY)
-                pos.clear()
-
             last_snap = time.time()
 
-        # ---------- TIME EXIT ----------
+        # ---------- EXIT ----------
         if now.time() >= SQUARE_OFF and pos:
-            stocko(ce_ts, "SELL", QTY)
-            stocko(pe_ts, "SELL", QTY)
+            stocko_order(ce_ts, "SELL", QTY)
+            stocko_order(pe_ts, "SELL", QTY)
             break
 
         # ---------- ENTRY ----------
-        if not pos and abs(spot - atm) <= ENTRY_TOL and trade_allowed(conn):
+        if not pos and trade_allowed(conn) and abs(spot - atm) <= ENTRY_TOL:
             opt = nfo[
                 (nfo["strike"] == atm) &
                 (nfo["instrument_type"].isin(["CE", "PE"]))
             ]
 
             expiry = min(pd.to_datetime(opt["expiry"]).dt.date)
-
-            ce_ts = opt[
-                (opt["instrument_type"] == "CE") &
-                (pd.to_datetime(opt["expiry"]).dt.date == expiry)
-            ].iloc[0]["tradingsymbol"]
-
-            pe_ts = opt[
-                (opt["instrument_type"] == "PE") &
-                (pd.to_datetime(opt["expiry"]).dt.date == expiry)
-            ].iloc[0]["tradingsymbol"]
+            ce_ts = opt[(opt["instrument_type"] == "CE") &
+                        (pd.to_datetime(opt["expiry"]).dt.date == expiry)].iloc[0]["tradingsymbol"]
+            pe_ts = opt[(opt["instrument_type"] == "PE") &
+                        (pd.to_datetime(opt["expiry"]).dt.date == expiry)].iloc[0]["tradingsymbol"]
 
             l = ltp([f"NFO:{ce_ts}", f"NFO:{pe_ts}"])
 
-            stocko(ce_ts, "BUY", QTY)
-            stocko(pe_ts, "BUY", QTY)
+            ok1 = stocko_order(ce_ts, "BUY", QTY)
+            ok2 = stocko_order(pe_ts, "BUY", QTY)
 
-            pos["CE"] = {"entry": l[f"NFO:{ce_ts}"], "strike": atm}
-            pos["PE"] = {"entry": l[f"NFO:{pe_ts}"], "strike": atm}
+            if ok1 and ok2:
+                pos["CE"] = l[f"NFO:{ce_ts}"]
+                pos["PE"] = l[f"NFO:{pe_ts}"]
+                print("✅ LIVE ENTRY CONFIRMED")
+            else:
+                print("🚫 ENTRY ABORTED (STOCKO FAIL)")
 
         time.sleep(POLL_SEC)
 
