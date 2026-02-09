@@ -4,25 +4,10 @@
 """
 NIFTY LONG STRADDLE – SPOT (LIVE SAFE, STOCKO + KILL-SWITCH + ATM ROLLING)
 ==========================================================================
-✔ BUY ATM CE + BUY ATM PE
-✔ SNAPSHOT every minute
-✔ Kill-switch: trade_flag.live_ls_nifty_spot
-    - If FALSE while position OPEN -> immediate square-off + halt
-    - Resume when TRUE again (and no positions)
-✔ PAPER + LIVE safe
-✔ NO fake PnL (pos created only if Stocko succeeds)
 
-🆕 FIXED / ADDED (as requested)
-------------------------------
-✅ Proper ATM rolling:
-   - Track active_atm once position is open
-   - If spot moves to next 50pt strike (atm changes) AND spot is within ±ENTRY_TOL of new atm:
-        -> exit old legs (capture exit LTP)
-        -> enter new ATM legs (capture entry LTP)
-✅ Store CE/PE exit prices in DB for:
-   - ROLL_EXIT
-   - FINAL EXIT (15:25)
-   - FLAG_FALSE_SQUAREOFF
+Adds FINAL/REALIZED PnL:
+- realized_pnl stored on EXIT / ROLL_EXIT
+- cum_realized_pnl stored as running total across rolls + final
 """
 
 import os, time, pytz, requests
@@ -78,9 +63,6 @@ def db_conn():
     return psycopg2.connect(url, sslmode="require", cursor_factory=RealDictCursor)
 
 def ensure_schema(conn):
-    """
-    Creates table if missing, and adds required columns if table already exists.
-    """
     with conn.cursor() as c:
         c.execute(sql.SQL("""
         CREATE TABLE IF NOT EXISTS {t} (
@@ -94,6 +76,8 @@ def ensure_schema(conn):
             ce_symbol TEXT,
             pe_symbol TEXT,
             unreal_pnl NUMERIC,
+            realized_pnl NUMERIC,
+            cum_realized_pnl NUMERIC,
             ce_entry NUMERIC,
             pe_entry NUMERIC,
             ce_exit NUMERIC,
@@ -102,13 +86,15 @@ def ensure_schema(conn):
         """).format(t=sql.Identifier(TABLE_NAME)))
     conn.commit()
 
-    # light auto-migration (safe if columns already exist)
+    # light auto-migration
     cols = [
         ("atm", "INTEGER"),
         ("ce_symbol", "TEXT"),
         ("pe_symbol", "TEXT"),
         ("ce_exit", "NUMERIC"),
         ("pe_exit", "NUMERIC"),
+        ("realized_pnl", "NUMERIC"),
+        ("cum_realized_pnl", "NUMERIC"),
     ]
     with conn.cursor() as c:
         for col, typ in cols:
@@ -122,10 +108,13 @@ def log_db(conn, **k):
     with conn.cursor() as c:
         c.execute(sql.SQL("""
         INSERT INTO {t}
-        (ts, bot_name, event, reason, spot, atm, ce_symbol, pe_symbol, unreal_pnl, ce_entry, pe_entry, ce_exit, pe_exit)
+        (ts, bot_name, event, reason, spot, atm, ce_symbol, pe_symbol,
+         unreal_pnl, realized_pnl, cum_realized_pnl,
+         ce_entry, pe_entry, ce_exit, pe_exit)
         VALUES
         (NOW(), %(bot)s, %(event)s, %(reason)s, %(spot)s, %(atm)s, %(ce_sym)s, %(pe_sym)s,
-         %(unreal)s, %(ce_entry)s, %(pe_entry)s, %(ce_exit)s, %(pe_exit)s)
+         %(unreal)s, %(realized)s, %(cum_realized)s,
+         %(ce_entry)s, %(pe_entry)s, %(ce_exit)s, %(pe_exit)s)
         """).format(t=sql.Identifier(TABLE_NAME)), k)
     conn.commit()
 
@@ -157,9 +146,6 @@ def _stocko_headers():
     return {"Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}"}
 
 def stocko_place_by_tradingsymbol(tradingsymbol: str, side: str, qty: int, offset=0):
-    """
-    MARKET order. In PAPER mode returns simulated success.
-    """
     if not LIVE_MODE:
         return {"simulated": True}
 
@@ -218,18 +204,31 @@ def stocko_place_by_tradingsymbol(tradingsymbol: str, side: str, qty: int, offse
 # =========================================================
 
 def pick_atm_symbols(nfo_df: pd.DataFrame, atm: int):
-    """
-    Picks nearest expiry CE/PE for a given strike from NFO instruments snapshot.
-    """
     opt = nfo_df[(nfo_df["strike"] == atm) & (nfo_df["instrument_type"].isin(["CE", "PE"]))]
     if opt.empty:
         return None, None
-
     expiry = min(pd.to_datetime(opt["expiry"]).dt.date)
-
     ce = opt[(opt["instrument_type"] == "CE") & (pd.to_datetime(opt["expiry"]).dt.date == expiry)].iloc[0]["tradingsymbol"]
     pe = opt[(opt["instrument_type"] == "PE") & (pd.to_datetime(opt["expiry"]).dt.date == expiry)].iloc[0]["tradingsymbol"]
     return ce, pe
+
+# =========================================================
+# PnL HELPERS
+# =========================================================
+
+def realized_pnl_for_exit(pos, ce_exit, pe_exit, qty):
+    """
+    Long straddle: BUY CE+PE.
+    realized = ((ce_exit - ce_entry) + (pe_exit - pe_entry)) * qty
+    Returns None if inputs missing.
+    """
+    if not pos:
+        return None
+    ce_entry = pos.get("CE")
+    pe_entry = pos.get("PE")
+    if ce_entry is None or pe_entry is None or ce_exit is None or pe_exit is None:
+        return None
+    return ((ce_exit - ce_entry) + (pe_exit - pe_entry)) * qty
 
 # =========================================================
 # MAIN
@@ -242,7 +241,6 @@ def main():
     nfo = pd.DataFrame(kite.instruments("NFO"))
     nfo = nfo[nfo["name"] == "NIFTY"].copy()
 
-    # Position state
     pos = {}                 # {"CE": entry_price, "PE": entry_price}
     ce_ts = pe_ts = None
     active_atm = None
@@ -250,12 +248,13 @@ def main():
     last_snap = 0
     halted = False
 
+    cum_realized = 0.0  # ✅ running realized pnl across rolls + final
+
     print(f"🚀 STARTED | LIVE_MODE={LIVE_MODE}")
 
     while True:
         now = datetime.now(MARKET_TZ)
 
-        # session guard
         if now.time() < MARKET_OPEN or now.time() > MARKET_CLOSE:
             time.sleep(30)
             continue
@@ -289,13 +288,15 @@ def main():
                 ce_sym=ce_ts,
                 pe_sym=pe_ts,
                 unreal=unreal,
+                realized=None,
+                cum_realized=cum_realized,
                 ce_entry=pos.get("CE"),
                 pe_entry=pos.get("PE"),
                 ce_exit=None,
                 pe_exit=None,
             )
 
-            # Kill-switch enforcement: if FALSE and position exists -> square off now + log exit prices
+            # Kill-switch enforcement
             if (not allowed) and pos and ce_ts and pe_ts:
                 ce_exit = pe_exit = None
                 try:
@@ -312,6 +313,10 @@ def main():
                 except Exception as e:
                     print("❌ FLAG EXIT FAILED:", e)
 
+                realized = realized_pnl_for_exit(pos, ce_exit, pe_exit, QTY)
+                if realized is not None:
+                    cum_realized += realized
+
                 log_db(
                     conn,
                     bot=BOT_NAME,
@@ -321,7 +326,9 @@ def main():
                     atm=active_atm,
                     ce_sym=ce_ts,
                     pe_sym=pe_ts,
-                    unreal=unreal,
+                    unreal=None,
+                    realized=realized,
+                    cum_realized=cum_realized,
                     ce_entry=pos.get("CE"),
                     pe_entry=pos.get("PE"),
                     ce_exit=ce_exit,
@@ -333,7 +340,6 @@ def main():
                 active_atm = None
                 halted = True
 
-            # resume when flag becomes true again
             if allowed and halted and not pos:
                 halted = False
                 log_db(
@@ -346,6 +352,8 @@ def main():
                     ce_sym=None,
                     pe_sym=None,
                     unreal=0.0,
+                    realized=None,
+                    cum_realized=cum_realized,
                     ce_entry=None,
                     pe_entry=None,
                     ce_exit=None,
@@ -370,6 +378,10 @@ def main():
             except Exception as e:
                 print("❌ 15:25 EXIT FAILED:", e)
 
+            realized = realized_pnl_for_exit(pos, ce_exit, pe_exit, QTY)
+            if realized is not None:
+                cum_realized += realized
+
             log_db(
                 conn,
                 bot=BOT_NAME,
@@ -380,12 +392,34 @@ def main():
                 ce_sym=ce_ts,
                 pe_sym=pe_ts,
                 unreal=None,
+                realized=realized,
+                cum_realized=cum_realized,
                 ce_entry=pos.get("CE"),
                 pe_entry=pos.get("PE"),
                 ce_exit=ce_exit,
                 pe_exit=pe_exit,
             )
-            print("⏹ 15:25 EXIT")
+
+            # Optional: one clean final row
+            log_db(
+                conn,
+                bot=BOT_NAME,
+                event="FINAL_PNL",
+                reason="DAY_END",
+                spot=spot,
+                atm=active_atm,
+                ce_sym=None,
+                pe_sym=None,
+                unreal=None,
+                realized=None,
+                cum_realized=cum_realized,
+                ce_entry=None,
+                pe_entry=None,
+                ce_exit=None,
+                pe_exit=None,
+            )
+
+            print(f"⏹ 15:25 EXIT | FINAL REALIZED PNL = {cum_realized:.2f}")
             break
 
         # ---------- HALT ----------
@@ -393,7 +427,7 @@ def main():
             time.sleep(POLL_SEC)
             continue
 
-        # ---------- ENTRY (first entry) ----------
+        # ---------- ENTRY ----------
         if (not pos) and (now.time() >= ENTRY_START):
             allowed_now = trade_allowed(conn)
             if allowed_now and abs(spot - atm) <= ENTRY_TOL:
@@ -416,7 +450,6 @@ def main():
                     time.sleep(POLL_SEC)
                     continue
 
-                # commit state only after success
                 ce_ts, pe_ts = ce_new, pe_new
                 pos["CE"], pos["PE"] = ce_p, pe_p
                 active_atm = atm
@@ -431,6 +464,8 @@ def main():
                     ce_sym=ce_ts,
                     pe_sym=pe_ts,
                     unreal=0.0,
+                    realized=None,
+                    cum_realized=cum_realized,
                     ce_entry=pos["CE"],
                     pe_entry=pos["PE"],
                     ce_exit=None,
@@ -440,13 +475,8 @@ def main():
                 print(f"✅ ENTRY @ ATM={active_atm} | {ce_ts} & {pe_ts}")
 
         # ---------- ROLLING LOGIC ----------
-        # Roll only when:
-        #   - position exists
-        #   - ATM has changed (next 50pt zone)
-        #   - spot is within ±ENTRY_TOL of new ATM (prevents flip-flop / noisy rolls)
         if pos and ce_ts and pe_ts and (active_atm is not None):
             if atm != active_atm and abs(spot - atm) <= ENTRY_TOL:
-                # capture exit prices first
                 ce_exit = pe_exit = None
                 try:
                     prices = ltp([f"NFO:{ce_ts}", f"NFO:{pe_ts}"])
@@ -455,15 +485,17 @@ def main():
                 except Exception:
                     pass
 
-                # square-off old legs
                 try:
                     stocko_place_by_tradingsymbol(ce_ts, "SELL", QTY, 201)
                     stocko_place_by_tradingsymbol(pe_ts, "SELL", QTY, 202)
                 except Exception as e:
                     print("❌ ROLL EXIT FAILED:", e)
-                    # If exit fails, do not proceed to new entry (safer)
                     time.sleep(POLL_SEC)
                     continue
+
+                realized = realized_pnl_for_exit(pos, ce_exit, pe_exit, QTY)
+                if realized is not None:
+                    cum_realized += realized
 
                 log_db(
                     conn,
@@ -475,16 +507,16 @@ def main():
                     ce_sym=ce_ts,
                     pe_sym=pe_ts,
                     unreal=None,
+                    realized=realized,
+                    cum_realized=cum_realized,
                     ce_entry=pos.get("CE"),
                     pe_entry=pos.get("PE"),
                     ce_exit=ce_exit,
                     pe_exit=pe_exit,
                 )
 
-                # pick new ATM symbols
                 ce_new, pe_new = pick_atm_symbols(nfo, atm)
                 if not ce_new or not pe_new:
-                    # exited but cannot re-enter; clear state safely
                     pos.clear()
                     ce_ts = pe_ts = None
                     active_atm = None
@@ -498,6 +530,8 @@ def main():
                         ce_sym=None,
                         pe_sym=None,
                         unreal=None,
+                        realized=None,
+                        cum_realized=cum_realized,
                         ce_entry=None,
                         pe_entry=None,
                         ce_exit=None,
@@ -522,6 +556,8 @@ def main():
                         ce_sym=ce_new,
                         pe_sym=pe_new,
                         unreal=None,
+                        realized=None,
+                        cum_realized=cum_realized,
                         ce_entry=None,
                         pe_entry=None,
                         ce_exit=None,
@@ -530,13 +566,11 @@ def main():
                     time.sleep(POLL_SEC)
                     continue
 
-                # enter new legs
                 try:
                     stocko_place_by_tradingsymbol(ce_new, "BUY", QTY, 203)
                     stocko_place_by_tradingsymbol(pe_new, "BUY", QTY, 204)
                 except Exception as e:
                     print("❌ ROLL ENTRY FAILED:", e)
-                    # exited already; clear state to avoid phantom position
                     pos.clear()
                     ce_ts = pe_ts = None
                     active_atm = None
@@ -550,6 +584,8 @@ def main():
                         ce_sym=ce_new,
                         pe_sym=pe_new,
                         unreal=None,
+                        realized=None,
+                        cum_realized=cum_realized,
                         ce_entry=None,
                         pe_entry=None,
                         ce_exit=None,
@@ -558,7 +594,6 @@ def main():
                     time.sleep(POLL_SEC)
                     continue
 
-                # commit new position state
                 ce_ts, pe_ts = ce_new, pe_new
                 pos["CE"], pos["PE"] = ce_p2, pe_p2
                 active_atm = atm
@@ -573,13 +608,15 @@ def main():
                     ce_sym=ce_ts,
                     pe_sym=pe_ts,
                     unreal=0.0,
+                    realized=None,
+                    cum_realized=cum_realized,
                     ce_entry=pos["CE"],
                     pe_entry=pos["PE"],
                     ce_exit=None,
                     pe_exit=None,
                 )
 
-                print(f"🔁 ROLLED to ATM={active_atm} | {ce_ts} & {pe_ts}")
+                print(f"🔁 ROLLED to ATM={active_atm} | {ce_ts} & {pe_ts} | cum_realized={cum_realized:.2f}")
 
         time.sleep(POLL_SEC)
 
