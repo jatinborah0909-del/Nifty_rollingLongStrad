@@ -8,6 +8,10 @@ NIFTY LONG STRADDLE – SPOT (LIVE SAFE, STOCKO + KILL-SWITCH + ATM ROLLING)
 Adds FINAL/REALIZED PnL:
 - realized_pnl stored on EXIT / ROLL_EXIT
 - cum_realized_pnl stored as running total across rolls + final
+
+FIXED:
+- Prevent rapid flip-flop rolls when spot hovers around strike midpoints.
+- Rolling happens ONLY when next 50pt strike is "earned" (boundary crossed with tolerance).
 """
 
 import os, time, pytz, requests
@@ -51,6 +55,32 @@ KITE_ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", "").strip()
 STOCKO_BASE_URL = os.getenv("STOCKO_BASE_URL", "https://api.stocko.in").strip()
 STOCKO_ACCESS_TOKEN = os.getenv("STOCKO_ACCESS_TOKEN", "").strip()
 STOCKO_CLIENT_ID = os.getenv("STOCKO_CLIENT_ID", "").strip()
+
+# =========================================================
+# 🔥 FIXED ATM HELPERS (CORE FIX)
+# =========================================================
+def initial_atm(spot: float) -> int:
+    """
+    Use ONLY for first-entry / display:
+    nearest 50pt strike.
+    """
+    return int(round(spot / STRIKE_STEP) * STRIKE_STEP)
+
+def next_atm(active_atm: int, spot: float) -> int | None:
+    """
+    Rolling ATM must be STATEFUL.
+
+    If active_atm = 25850 and step=50:
+      roll UP when spot >= 25900 - ENTRY_TOL
+      roll DN when spot <= 25800 + ENTRY_TOL
+
+    Returns the new ATM strike if shift condition is met, else None.
+    """
+    if spot >= (active_atm + STRIKE_STEP - ENTRY_TOL):
+        return active_atm + STRIKE_STEP
+    if spot <= (active_atm - STRIKE_STEP + ENTRY_TOL):
+        return active_atm - STRIKE_STEP
+    return None
 
 # =========================================================
 # DB
@@ -204,7 +234,7 @@ def stocko_place_by_tradingsymbol(tradingsymbol: str, side: str, qty: int, offse
 # =========================================================
 
 def pick_atm_symbols(nfo_df: pd.DataFrame, atm: int):
-    opt = nfo_df[(nfo_df["strike"] == atm) & (nfo_df["instrument_type"].isin(["CE", "PE"]))]
+    opt = nfo_df[(nfo_df["strike"] == atm) & (nfo_df["instrument_type"].isin(["CE", "PE"]))].copy()
     if opt.empty:
         return None, None
     expiry = min(pd.to_datetime(opt["expiry"]).dt.date)
@@ -248,7 +278,7 @@ def main():
     last_snap = 0
     halted = False
 
-    cum_realized = 0.0  # ✅ running realized pnl across rolls + final
+    cum_realized = 0.0  # running realized pnl across rolls + final
 
     print(f"🚀 STARTED | LIVE_MODE={LIVE_MODE}")
 
@@ -264,7 +294,8 @@ def main():
             time.sleep(POLL_SEC)
             continue
 
-        atm = int(round(spot / STRIKE_STEP) * STRIKE_STEP)
+        # For display/entry only (not for rolling):
+        atm_nearest = initial_atm(spot)
 
         # ---------- SNAPSHOT + FLAG ENFORCEMENT ----------
         if time.time() - last_snap >= SNAPSHOT_SEC:
@@ -274,8 +305,8 @@ def main():
             if pos and ce_ts and pe_ts:
                 l = ltp([f"NFO:{ce_ts}", f"NFO:{pe_ts}"])
                 unreal = (
-                    (l[f"NFO:{ce_ts}"] - pos["CE"]) +
-                    (l[f"NFO:{pe_ts}"] - pos["PE"])
+                    (l.get(f"NFO:{ce_ts}", 0) - pos["CE"]) +
+                    (l.get(f"NFO:{pe_ts}", 0) - pos["PE"])
                 ) * QTY
 
             log_db(
@@ -284,7 +315,7 @@ def main():
                 event="SNAPSHOT",
                 reason=f"FLAG={allowed},HALT={halted}",
                 spot=spot,
-                atm=active_atm if active_atm is not None else atm,
+                atm=active_atm if active_atm is not None else atm_nearest,
                 ce_sym=ce_ts,
                 pe_sym=pe_ts,
                 unreal=unreal,
@@ -348,7 +379,7 @@ def main():
                     event="RESUME",
                     reason="FLAG_TRUE_RESUME",
                     spot=spot,
-                    atm=atm,
+                    atm=atm_nearest,
                     ce_sym=None,
                     pe_sym=None,
                     unreal=0.0,
@@ -430,8 +461,8 @@ def main():
         # ---------- ENTRY ----------
         if (not pos) and (now.time() >= ENTRY_START):
             allowed_now = trade_allowed(conn)
-            if allowed_now and abs(spot - atm) <= ENTRY_TOL:
-                ce_new, pe_new = pick_atm_symbols(nfo, atm)
+            if allowed_now and abs(spot - atm_nearest) <= ENTRY_TOL:
+                ce_new, pe_new = pick_atm_symbols(nfo, atm_nearest)
                 if not ce_new or not pe_new:
                     time.sleep(POLL_SEC)
                     continue
@@ -452,7 +483,7 @@ def main():
 
                 ce_ts, pe_ts = ce_new, pe_new
                 pos["CE"], pos["PE"] = ce_p, pe_p
-                active_atm = atm
+                active_atm = atm_nearest
 
                 log_db(
                     conn,
@@ -474,9 +505,13 @@ def main():
 
                 print(f"✅ ENTRY @ ATM={active_atm} | {ce_ts} & {pe_ts}")
 
-        # ---------- ROLLING LOGIC ----------
+        # ---------- ROLLING LOGIC (🔥 FIXED – NO FLIP-FLOP) ----------
         if pos and ce_ts and pe_ts and (active_atm is not None):
-            if atm != active_atm and abs(spot - atm) <= ENTRY_TOL:
+
+            # ✅ compute next ATM only when boundary is crossed (prevents bouncing)
+            new_atm = next_atm(active_atm, spot)
+
+            if new_atm is not None and new_atm != active_atm:
                 ce_exit = pe_exit = None
                 try:
                     prices = ltp([f"NFO:{ce_ts}", f"NFO:{pe_ts}"])
@@ -501,7 +536,7 @@ def main():
                     conn,
                     bot=BOT_NAME,
                     event="ROLL_EXIT",
-                    reason=f"ATM_SHIFT {active_atm} -> {atm}",
+                    reason=f"ATM_SHIFT {active_atm} -> {new_atm}",
                     spot=spot,
                     atm=active_atm,
                     ce_sym=ce_ts,
@@ -515,7 +550,7 @@ def main():
                     pe_exit=pe_exit,
                 )
 
-                ce_new, pe_new = pick_atm_symbols(nfo, atm)
+                ce_new, pe_new = pick_atm_symbols(nfo, new_atm)
                 if not ce_new or not pe_new:
                     pos.clear()
                     ce_ts = pe_ts = None
@@ -524,9 +559,9 @@ def main():
                         conn,
                         bot=BOT_NAME,
                         event="ERROR",
-                        reason=f"ROLL_REENTRY_SYMBOL_NOT_FOUND atm={atm}",
+                        reason=f"ROLL_REENTRY_SYMBOL_NOT_FOUND atm={new_atm}",
                         spot=spot,
-                        atm=atm,
+                        atm=new_atm,
                         ce_sym=None,
                         pe_sym=None,
                         unreal=None,
@@ -550,9 +585,9 @@ def main():
                         conn,
                         bot=BOT_NAME,
                         event="ERROR",
-                        reason=f"ROLL_REENTRY_LTP_MISSING atm={atm}",
+                        reason=f"ROLL_REENTRY_LTP_MISSING atm={new_atm}",
                         spot=spot,
-                        atm=atm,
+                        atm=new_atm,
                         ce_sym=ce_new,
                         pe_sym=pe_new,
                         unreal=None,
@@ -578,9 +613,9 @@ def main():
                         conn,
                         bot=BOT_NAME,
                         event="ERROR",
-                        reason=f"ROLL_ENTRY_FAILED atm={atm} err={e}",
+                        reason=f"ROLL_ENTRY_FAILED atm={new_atm} err={e}",
                         spot=spot,
-                        atm=atm,
+                        atm=new_atm,
                         ce_sym=ce_new,
                         pe_sym=pe_new,
                         unreal=None,
@@ -596,7 +631,7 @@ def main():
 
                 ce_ts, pe_ts = ce_new, pe_new
                 pos["CE"], pos["PE"] = ce_p2, pe_p2
-                active_atm = atm
+                active_atm = new_atm
 
                 log_db(
                     conn,
